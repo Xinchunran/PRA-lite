@@ -275,16 +275,37 @@ def _make_encoded_record() -> Dict[str, Any]:
     a dictionary with profile_tokens, event_tokens, timestamps, and label.
     """
     return {
-        "entity_id": "acct_001",
-        "profile_tokens": np.array([101, 201, 301], dtype=np.int64),
-        "event_tokens": np.array(
+        "entity_id": 1,
+        "profile_key_ids": np.array([101, 201, 301], dtype=np.int64),
+        "profile_value_ids": np.array([401, 501, 601], dtype=np.int64),
+        "profile_value_pos": np.array([0, 0, 0], dtype=np.int64),
+        "profile_time": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        "profile_mask": np.array([1, 1, 1], dtype=np.int64),
+        "event_key_ids": np.array(
             [
                 [11, 111, 12, 112, 13, 113],
                 [21, 121, 22, 122, 23, 123],
             ],
             dtype=np.int64,
         ),
-        "event_times": np.array([100.0, 10.0], dtype=np.float32),
+        "event_value_ids": np.array(
+            [
+                [211, 311, 212, 312, 213, 313],
+                [221, 321, 222, 322, 223, 323],
+            ],
+            dtype=np.int64,
+        ),
+        "event_value_pos": np.zeros((2, 6), dtype=np.int64),
+        "event_token_mask": np.ones((2, 6), dtype=np.int64),
+        "event_time": np.array([100.0, 10.0], dtype=np.float32),
+        "calendar_features": np.array(
+            [
+                [12.0, 1.0, 2.0, 0.5, 0.6, 0.7],
+                [18.0, 3.0, 5.0, 0.2, 0.3, 0.4],
+            ],
+            dtype=np.float32,
+        ),
+        "event_mask": np.array([1, 1], dtype=np.int64),
         "label": 1,
     }
 
@@ -310,7 +331,7 @@ def _flatten_batch_values(obj: Any) -> List[Any]:
 def test_mlm_collator_does_not_put_downstream_label_into_model_inputs() -> None:
     """The downstream label may be returned separately, but must never be part of MLM input tokens."""
     Collator = _optional_symbol("PRAGMA_MASK_COLLATOR_CLASS", "src.tokenizer.masking:MaskedEventCollator")
-    collator = Collator(mask_token_id=999, unk_token_id=998, mlm_probability=0.5, seed=123)
+    collator = Collator(mask_token_id=999, unk_token_id=998, token_mask_probability=0.5, seed=123)
 
     batch = collator([_make_encoded_record()])
     assert isinstance(batch, Mapping), "Collator must return a mapping/dict-like batch"
@@ -334,13 +355,13 @@ def test_mlm_labels_are_ignore_index_except_at_masked_positions() -> None:
         pytest.skip("torch is unavailable")
 
     Collator = _optional_symbol("PRAGMA_MASK_COLLATOR_CLASS", "src.tokenizer.masking:MaskedEventCollator")
-    collator = Collator(mask_token_id=999, unk_token_id=998, mlm_probability=0.5, seed=123)
+    collator = Collator(mask_token_id=999, unk_token_id=998, token_mask_probability=0.5, seed=123)
     batch = collator([_make_encoded_record()])
 
-    input_ids = batch.get("input_ids", batch.get("event_input_ids", None))
-    mlm_labels = batch.get("mlm_labels", batch.get("labels", None))
-    assert input_ids is not None, "Collator must expose input_ids or event_input_ids"
-    assert mlm_labels is not None, "Collator must expose mlm_labels or labels for MLM"
+    input_ids = batch.get("event_value_ids", None)
+    mlm_labels = batch.get("mlm_labels", None)
+    assert input_ids is not None, "Collator must expose event_value_ids"
+    assert mlm_labels is not None, "Collator must expose mlm_labels for MLM"
 
     input_ids = torch.as_tensor(input_ids)
     mlm_labels = torch.as_tensor(mlm_labels)
@@ -393,13 +414,21 @@ def _tiny_batch() -> Dict[str, Any]:
     if torch is None:
         pytest.skip("torch is unavailable")
     return {
-        "profile_input_ids": torch.tensor([[101, 201, 301]], dtype=torch.long),
-        "event_input_ids": torch.tensor([[[11, 111, 12, 112, 13, 113], [21, 121, 22, 122, 23, 123]]], dtype=torch.long),
-        "event_times": torch.tensor([[100.0, 10.0]], dtype=torch.float32),
+        "profile_key_ids": torch.tensor([[101, 201, 301]], dtype=torch.long),
+        "profile_value_ids": torch.tensor([[401, 501, 601]], dtype=torch.long),
+        "profile_value_pos": torch.tensor([[0, 0, 0]], dtype=torch.long),
+        "profile_time": torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32),
+        "profile_mask": torch.tensor([[1, 1, 1]], dtype=torch.bool),
+        "event_key_ids": torch.tensor([[[11, 111, 12, 112, 13, 113], [21, 121, 22, 122, 23, 123]]], dtype=torch.long),
+        "event_value_ids": torch.tensor([[[211, 311, 212, 312, 213, 313], [221, 321, 222, 322, 223, 323]]], dtype=torch.long),
+        "event_value_pos": torch.zeros((1, 2, 6), dtype=torch.long),
+        "event_token_mask": torch.ones((1, 2, 6), dtype=torch.bool),
+        "event_time": torch.tensor([[100.0, 10.0]], dtype=torch.float32),
         "calendar_features": torch.tensor(
             [[[12.0, 1.0, 2.0, 0.5, 0.6, 0.7], [18.0, 3.0, 5.0, 0.2, 0.3, 0.4]]],
             dtype=torch.float32,
         ),
+        "event_mask": torch.tensor([[1, 1]], dtype=torch.bool),
     }
 
 
@@ -425,13 +454,25 @@ def test_event_encoder_is_independent_before_history_encoder() -> None:
 
     batch = _tiny_batch()
     with torch.no_grad():
-        z1 = model.encode_events(batch["event_input_ids"], calendar_features=batch.get("calendar_features"))
+        z1 = model.encode_events(
+            batch["event_key_ids"],
+            batch["event_value_ids"],
+            batch["event_value_pos"],
+            batch["event_token_mask"],
+            calendar_features=batch.get("calendar_features"),
+        )
 
     changed = dict(batch)
-    changed["event_input_ids"] = batch["event_input_ids"].clone()
-    changed["event_input_ids"][:, 1, :] += 100  # perturb only second event
+    changed["event_value_ids"] = batch["event_value_ids"].clone()
+    changed["event_value_ids"][:, 1, :] += 100  # perturb only second event
     with torch.no_grad():
-        z2 = model.encode_events(changed["event_input_ids"], calendar_features=changed.get("calendar_features"))
+        z2 = model.encode_events(
+            changed["event_key_ids"],
+            changed["event_value_ids"],
+            changed["event_value_pos"],
+            changed["event_token_mask"],
+            calendar_features=changed.get("calendar_features"),
+        )
 
     z1 = torch.as_tensor(z1)
     z2 = torch.as_tensor(z2)
@@ -453,9 +494,13 @@ def test_history_encoder_is_sensitive_to_event_order_and_time() -> None:
         base = _get_record_embedding(model(**batch))
 
     swapped = dict(batch)
-    swapped["event_input_ids"] = batch["event_input_ids"].flip(dims=[1])
-    swapped["event_times"] = batch["event_times"].flip(dims=[1])
+    swapped["event_key_ids"] = batch["event_key_ids"].flip(dims=[1])
+    swapped["event_value_ids"] = batch["event_value_ids"].flip(dims=[1])
+    swapped["event_value_pos"] = batch["event_value_pos"].flip(dims=[1])
+    swapped["event_token_mask"] = batch["event_token_mask"].flip(dims=[1])
+    swapped["event_time"] = batch["event_time"].flip(dims=[1])
     swapped["calendar_features"] = batch["calendar_features"].flip(dims=[1])
+    swapped["event_mask"] = batch["event_mask"].flip(dims=[1])
 
     with torch.no_grad():
         changed = _get_record_embedding(model(**swapped))
@@ -474,7 +519,7 @@ def test_profile_state_affects_record_embedding() -> None:
         base = _get_record_embedding(model(**batch))
 
     changed = dict(batch)
-    changed["profile_input_ids"] = batch["profile_input_ids"].clone() + 17
+    changed["profile_value_ids"] = batch["profile_value_ids"].clone() + 17
     with torch.no_grad():
         changed_embedding = _get_record_embedding(model(**changed))
 

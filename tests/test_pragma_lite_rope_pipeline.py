@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-from src.model.pragma_lite import PragmaLite, PragmaLiteConfig, PragmaLiteModel
+from src.model.pragma_lite import PragmaLiteConfig, PragmaLiteModel
 from src.training.checkpoint import load_checkpoint
 from src.training.pretrain_mlm import main as pretrain_main
 
@@ -32,7 +32,7 @@ def test_rope_is_enabled_for_profile_and_history_encoders() -> None:
     assert model.event_encoder.use_rope is False
 
 
-def test_flat_wrapper_splits_profile_events_and_returns_mlm_logits() -> None:
+def test_structured_backbone_returns_mlm_logits() -> None:
     cfg = PragmaLiteConfig(
         vocab_size=64,
         d_model=32,
@@ -43,26 +43,32 @@ def test_flat_wrapper_splits_profile_events_and_returns_mlm_logits() -> None:
         event_layers=1,
         history_layers=1,
         dropout=0.0,
-        max_seq_len=32,
         max_profile_tokens=4,
         max_event_tokens=4,
         max_events=3,
     )
-    model = PragmaLite(cfg)
-    input_ids = torch.tensor([[3, 10, 11, 4, 20, 21, 4, 30, 31]], dtype=torch.long)
-    attention_mask = torch.ones_like(input_ids)
+    model = PragmaLiteModel(cfg)
+    batch = {
+        "profile_key_ids": torch.tensor([[10, 11, 0, 0]], dtype=torch.long),
+        "profile_value_ids": torch.tensor([[20, 21, 0, 0]], dtype=torch.long),
+        "profile_value_pos": torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+        "profile_time": torch.tensor([[0.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+        "profile_mask": torch.tensor([[1, 1, 0, 0]], dtype=torch.bool),
+        "event_key_ids": torch.tensor([[[30, 31, 0, 0], [40, 41, 0, 0], [0, 0, 0, 0]]], dtype=torch.long),
+        "event_value_ids": torch.tensor([[[32, 33, 0, 0], [42, 43, 0, 0], [0, 0, 0, 0]]], dtype=torch.long),
+        "event_value_pos": torch.zeros((1, 3, 4), dtype=torch.long),
+        "event_token_mask": torch.tensor([[[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 0, 0]]], dtype=torch.bool),
+        "event_time": torch.tensor([[2.0, 1.0, 0.0]], dtype=torch.float32),
+        "calendar_features": torch.tensor([[[0.0] * 6, [1.0] * 6, [0.0] * 6]], dtype=torch.float32),
+        "event_mask": torch.tensor([[1, 1, 0]], dtype=torch.bool),
+    }
 
-    pieces = model._split_flat_inputs(input_ids, attention_mask=attention_mask)
-    assert pieces["profile_input_ids"][0, :2].tolist() == [10, 11]
-    assert pieces["event_input_ids"][0, 0, :3].tolist() == [4, 20, 21]
-    assert pieces["event_input_ids"][0, 1, :3].tolist() == [4, 30, 31]
-
-    logits = model(input_ids, attention_mask=attention_mask, return_mlm_logits=True)
-    hidden = model(input_ids, attention_mask=attention_mask, return_mlm_logits=False)
-    assert logits.shape == (1, input_ids.size(1), cfg.vocab_size)
-    assert hidden.shape == (1, input_ids.size(1), cfg.d_model)
+    logits = model(**batch, return_mlm_logits=True)
+    hidden = model(**batch, return_mlm_logits=False)
+    assert logits.shape == (1, 3, 4, cfg.vocab_size)
+    assert hidden["record_embedding"].shape == (1, cfg.d_model)
     assert torch.isfinite(logits).all()
-    assert torch.isfinite(hidden).all()
+    assert torch.isfinite(hidden["record_embedding"]).all()
 
 
 def test_pretrain_pipeline_smoke_runs_with_rope_hierarchical_model(tmp_path: Path, monkeypatch) -> None:
@@ -138,8 +144,8 @@ def test_pretrain_pipeline_smoke_runs_with_rope_hierarchical_model(tmp_path: Pat
         json.dumps(
             {
                 "token_to_id": token_to_id,
-                "profile_cols": ["region"],
-                "event_cols": ["merchant"],
+        "profile_cols": ["region"],
+        "event_cols": ["merchant"],
                 "numeric_binners": {},
             }
         )
@@ -151,20 +157,50 @@ def test_pretrain_pipeline_smoke_runs_with_rope_hierarchical_model(tmp_path: Pat
         [
             {
                 "entity_id": 1,
-                "input_ids": [3, 5, 6, 4, 7, 8, 4, 9, 10],
-                "attention_mask": [1] * 9,
+                "profile_key_ids": [5, 0, 0, 0],
+                "profile_value_ids": [6, 0, 0, 0],
+                "profile_value_pos": [0, 0, 0, 0],
+                "profile_time": [0.0, 0.0, 0.0, 0.0],
+                "profile_mask": [1, 0, 0, 0],
+                "event_key_ids": [[7, 0, 0, 0], [9, 0, 0, 0], [0, 0, 0, 0]],
+                "event_value_ids": [[8, 0, 0, 0], [10, 0, 0, 0], [0, 0, 0, 0]],
+                "event_value_pos": [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+                "event_token_mask": [[1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]],
+                "event_time": [2.0, 1.0, 0.0],
+                "calendar_features": [[0.0] * 6, [1.0] * 6, [0.0] * 6],
+                "event_mask": [1, 1, 0],
                 "label": 0,
             },
             {
                 "entity_id": 2,
-                "input_ids": [3, 6, 5, 4, 8, 7, 4, 10, 9],
-                "attention_mask": [1] * 9,
+                "profile_key_ids": [5, 0, 0, 0],
+                "profile_value_ids": [6, 0, 0, 0],
+                "profile_value_pos": [0, 0, 0, 0],
+                "profile_time": [0.0, 0.0, 0.0, 0.0],
+                "profile_mask": [1, 0, 0, 0],
+                "event_key_ids": [[7, 0, 0, 0], [9, 0, 0, 0], [0, 0, 0, 0]],
+                "event_value_ids": [[8, 0, 0, 0], [10, 0, 0, 0], [0, 0, 0, 0]],
+                "event_value_pos": [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+                "event_token_mask": [[1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]],
+                "event_time": [1.8, 0.9, 0.0],
+                "calendar_features": [[1.0] * 6, [0.5] * 6, [0.0] * 6],
+                "event_mask": [1, 1, 0],
                 "label": 1,
             },
             {
                 "entity_id": 3,
-                "input_ids": [3, 5, 5, 4, 7, 7, 4, 9, 9],
-                "attention_mask": [1] * 9,
+                "profile_key_ids": [5, 0, 0, 0],
+                "profile_value_ids": [6, 0, 0, 0],
+                "profile_value_pos": [0, 0, 0, 0],
+                "profile_time": [0.0, 0.0, 0.0, 0.0],
+                "profile_mask": [1, 0, 0, 0],
+                "event_key_ids": [[7, 0, 0, 0], [9, 0, 0, 0], [0, 0, 0, 0]],
+                "event_value_ids": [[8, 0, 0, 0], [10, 0, 0, 0], [0, 0, 0, 0]],
+                "event_value_pos": [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+                "event_token_mask": [[1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]],
+                "event_time": [1.2, 0.0, 0.0],
+                "calendar_features": [[0.2] * 6, [0.0] * 6, [0.0] * 6],
+                "event_mask": [1, 0, 0],
                 "label": 0,
             },
         ]
@@ -197,15 +233,27 @@ def test_pretrain_pipeline_smoke_runs_with_rope_hierarchical_model(tmp_path: Pat
     assert ckpt_path.exists()
 
     ckpt = load_checkpoint(ckpt_path, map_location="cpu")
-    model = PragmaLite(PragmaLiteConfig(**ckpt["model_cfg"]))
+    model = PragmaLiteModel(PragmaLiteConfig(**ckpt["model_cfg"]))
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    batch_input_ids = torch.tensor([[3, 5, 6, 4, 7, 8, 4, 9, 10]], dtype=torch.long)
-    batch_attention_mask = torch.ones_like(batch_input_ids)
+    batch = {
+        "profile_key_ids": torch.tensor([[5, 0, 0, 0]], dtype=torch.long),
+        "profile_value_ids": torch.tensor([[6, 0, 0, 0]], dtype=torch.long),
+        "profile_value_pos": torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+        "profile_time": torch.tensor([[0.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+        "profile_mask": torch.tensor([[1, 0, 0, 0]], dtype=torch.bool),
+        "event_key_ids": torch.tensor([[[7, 0, 0, 0], [9, 0, 0, 0], [0, 0, 0, 0]]], dtype=torch.long),
+        "event_value_ids": torch.tensor([[[8, 0, 0, 0], [10, 0, 0, 0], [0, 0, 0, 0]]], dtype=torch.long),
+        "event_value_pos": torch.zeros((1, 3, 4), dtype=torch.long),
+        "event_token_mask": torch.tensor([[[1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]]], dtype=torch.bool),
+        "event_time": torch.tensor([[2.0, 1.0, 0.0]], dtype=torch.float32),
+        "calendar_features": torch.tensor([[[0.0] * 6, [1.0] * 6, [0.0] * 6]], dtype=torch.float32),
+        "event_mask": torch.tensor([[1, 1, 0]], dtype=torch.bool),
+    }
     with torch.no_grad():
-        logits = model(batch_input_ids, attention_mask=batch_attention_mask, return_mlm_logits=True)
-        hidden = model(batch_input_ids, attention_mask=batch_attention_mask)
+        logits = model(**batch, return_mlm_logits=True)
+        hidden = model(**batch)
 
-    assert logits.shape == (1, batch_input_ids.size(1), model.vocab_size)
-    assert hidden.shape == (1, batch_input_ids.size(1), model.d_model)
+    assert logits.shape == (1, 3, 4, model.vocab_size)
+    assert hidden["record_embedding"].shape == (1, model.d_model)

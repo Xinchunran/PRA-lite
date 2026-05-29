@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.model.pragma_lite.model import PragmaLite, PragmaLiteConfig, PragmaLiteModel
+from src.model.pragma_lite.model import PragmaLiteConfig, PragmaLiteModel
 from src.tokenizer.vocab import TokenizerVocab
 from src.training.checkpoint import load_checkpoint
 from src.training.data import TokenizedDataset, pad_collate, read_ids
@@ -49,8 +49,7 @@ def main() -> None:
 
     ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=ids)
     cfg = PragmaLiteConfig(**ckpt["model_cfg"])
-    model_cls = PragmaLiteModel if ds.has_structured_inputs else PragmaLite
-    model = model_cls(cfg)
+    model = PragmaLiteModel(cfg)
     model.load_state_dict(ckpt["model_state"])
     model.to(args.device)
     model.eval()
@@ -70,10 +69,7 @@ def main() -> None:
 
             model_inputs = {key: value.to(args.device) for key, value in batch.model_inputs().items() if value is not None}
             h = model(**model_inputs)
-            if isinstance(h, dict):
-                emb = h["record_embedding"].detach().cpu().numpy()
-            else:
-                emb = h[:, 0, :].detach().cpu().numpy()
+            emb = h["record_embedding"].detach().cpu().numpy()
 
             for i in range(len(entity_ids)):
                 row = {"entity_id": int(entity_ids[i])}

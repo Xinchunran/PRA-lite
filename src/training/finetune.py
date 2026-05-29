@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.common.yaml_utils import load_yaml
-from src.model.pragma_lite.model import PragmaLite, PragmaLiteConfig, PragmaLiteModel
+from src.model.pragma_lite.model import PragmaLiteConfig, PragmaLiteModel
 from src.tokenizer.vocab import TokenizerVocab
 from src.training.checkpoint import load_checkpoint, save_checkpoint
 from src.training.data import TokenizedDataset, pad_collate, read_ids, set_seed
@@ -20,14 +20,12 @@ from src.training.data import TokenizedDataset, pad_collate, read_ids, set_seed
 def _load_model_from_checkpoint(
     ckpt_path: Path,
     device: str,
-    structured_inputs: bool,
 ) -> tuple[nn.Module, TokenizerVocab, dict]:
     ckpt = load_checkpoint(ckpt_path, map_location=device)
     tokenizer_dir = Path(ckpt["tokenizer_dir"])
     vocab = TokenizerVocab.load(tokenizer_dir)
     cfg = PragmaLiteConfig(**ckpt["model_cfg"])
-    model_cls = PragmaLiteModel if structured_inputs else PragmaLite
-    model = model_cls(cfg)
+    model = PragmaLiteModel(cfg)
     model.load_state_dict(ckpt["model_state"])
     model.to(device)
     return model, vocab, ckpt
@@ -59,7 +57,6 @@ def main() -> None:
     model, vocab, ckpt = _load_model_from_checkpoint(
         Path(args.checkpoint),
         args.device,
-        structured_inputs=train_ds.has_structured_inputs,
     )
 
     batch_size = int(train_cfg["training"].get("batch_size", 32))

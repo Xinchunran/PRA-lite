@@ -73,7 +73,7 @@ class PragmaAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, d_model = x.shape
@@ -90,11 +90,9 @@ class PragmaAttention(nn.Module):
             q = (q * cos) + (_rotate_half(q) * sin)
             k = (k * cos) + (_rotate_half(k) * sin)
 
-        scale = self.head_dim ** -0.5
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if attention_mask is not None:
-            valid = attention_mask.bool()
-            scores = scores.masked_fill(~valid[:, None, None, :], torch.finfo(scores.dtype).min)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        if mask is not None:
+            scores = scores.masked_fill(~mask.bool()[:, None, None, :], torch.finfo(scores.dtype).min)
         attn = scores.softmax(dim=-1)
         attn = self.attn_dropout(attn)
         out = torch.matmul(attn, v)
@@ -120,10 +118,10 @@ class PragmaEncoderLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.dropout1(self.attn(self.norm1(x), attention_mask=attention_mask, positions=positions))
+        x = x + self.dropout1(self.attn(self.norm1(x), mask=mask, positions=positions))
         x = x + self.dropout2(self.ffn(self.norm2(x)))
         return x
 
@@ -159,12 +157,33 @@ class PragmaEncoder(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x, attention_mask=attention_mask, positions=positions)
+            x = layer(x, mask=mask, positions=positions)
         return self.norm(x)
+
+
+class KeyValueEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, d_model: int, max_value_pos: int, dropout: float) -> None:
+        super().__init__()
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.value_pos_emb = nn.Embedding(max_value_pos, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        key_ids: torch.Tensor,
+        value_ids: torch.Tensor,
+        value_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = (
+            self.token_emb(key_ids)
+            + self.token_emb(value_ids)
+            + self.value_pos_emb(value_pos.clamp_min(0))
+        )
+        return self.dropout(hidden)
 
 
 class PragmaLiteModel(nn.Module):
@@ -188,9 +207,15 @@ class PragmaLiteModel(nn.Module):
         self.max_profile_tokens = cfg.max_profile_tokens
         self.max_event_tokens = cfg.max_event_tokens
         self.max_events = cfg.max_events
-        self.token_emb = nn.Embedding(self.vocab_size, self.d_model)
-        self.dropout = nn.Dropout(cfg.dropout)
+
+        self.kv_embedding = KeyValueEmbedding(
+            vocab_size=self.vocab_size,
+            d_model=self.d_model,
+            max_value_pos=max(cfg.max_profile_tokens, cfg.max_event_tokens) + 1,
+            dropout=cfg.dropout,
+        )
         self.profile_cls = nn.Parameter(torch.zeros(1, 1, self.d_model))
+        self.event_cls = nn.Parameter(torch.zeros(1, 1, self.d_model))
         self.profile_encoder = PragmaEncoder(
             num_layers=cfg.profile_layers,
             d_model=self.d_model,
@@ -218,6 +243,7 @@ class PragmaLiteModel(nn.Module):
             use_rope=True,
             rope_base=cfg.rope_base,
         )
+        self.history_order_emb = nn.Embedding(cfg.max_events + 1, self.d_model)
         self.calendar_proj = nn.Linear(6, self.d_model)
         self.time_proj = nn.Sequential(nn.Linear(1, self.d_model), nn.Tanh())
         self.fusion = nn.Sequential(
@@ -232,85 +258,116 @@ class PragmaLiteModel(nn.Module):
         )
         self.cls_head = nn.Linear(self.d_model, 1)
         nn.init.normal_(self.profile_cls, std=0.02)
+        nn.init.normal_(self.event_cls, std=0.02)
+
+    def _prepend_positions(self, values: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor | None:
+        if values is None:
+            return None
+        zeros = torch.zeros((batch_size, 1), dtype=values.dtype, device=device)
+        return torch.cat([zeros, values], dim=1)
 
     def _encode_profile(
         self,
-        profile_input_ids: torch.Tensor,
-        profile_attention_mask: torch.Tensor | None = None,
+        profile_key_ids: torch.Tensor,
+        profile_value_ids: torch.Tensor,
+        profile_value_pos: torch.Tensor,
+        profile_time: torch.Tensor | None = None,
+        profile_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, num_tokens = profile_input_ids.shape
-        token_hidden = self.dropout(self.token_emb(profile_input_ids))
+        batch_size, _ = profile_key_ids.shape
+        token_hidden = self.kv_embedding(profile_key_ids, profile_value_ids, profile_value_pos)
+        if profile_time is not None:
+            token_hidden = token_hidden + self.time_proj(profile_time.unsqueeze(-1).to(token_hidden.dtype))
         cls_token = self.profile_cls.expand(batch_size, -1, -1)
-        profile_hidden = torch.cat([cls_token, token_hidden], dim=1)
-        if profile_attention_mask is None:
-            mask = torch.ones((batch_size, num_tokens + 1), dtype=torch.bool, device=profile_input_ids.device)
+        hidden = torch.cat([cls_token, token_hidden], dim=1)
+        if profile_mask is None:
+            mask = torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device)
         else:
-            mask = torch.cat(
-                [
-                    torch.ones((batch_size, 1), dtype=torch.bool, device=profile_input_ids.device),
-                    profile_attention_mask.bool(),
-                ],
-                dim=1,
-            )
-        encoded = self.profile_encoder(profile_hidden, attention_mask=mask)
+            mask = torch.cat([torch.ones((batch_size, 1), dtype=torch.bool, device=hidden.device), profile_mask.bool()], dim=1)
+        positions = self._prepend_positions(profile_time, batch_size=batch_size, device=hidden.device)
+        encoded = self.profile_encoder(hidden, mask=mask, positions=positions)
         return encoded[:, 0, :], encoded[:, 1:, :]
 
     def encode_events(
         self,
-        event_input_ids: torch.Tensor,
+        event_key_ids: torch.Tensor,
+        event_value_ids: torch.Tensor,
+        event_value_pos: torch.Tensor,
+        event_token_mask: torch.Tensor,
         calendar_features: torch.Tensor | None = None,
-        event_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        batch_size, num_events, num_tokens = event_input_ids.shape
+        batch_size, num_events, num_tokens = event_key_ids.shape
         if num_events == 0:
-            return self.token_emb.weight.new_zeros((batch_size, 0, self.d_model))
-        token_hidden = self.token_emb(event_input_ids)
+            return event_key_ids.new_zeros((batch_size, 0, self.d_model), dtype=torch.float32)
+        token_hidden = self.kv_embedding(event_key_ids, event_value_ids, event_value_pos)
         flat_hidden = token_hidden.view(batch_size * num_events, num_tokens, self.d_model)
-        flat_mask = None
-        if event_attention_mask is not None:
-            flat_mask = event_attention_mask.view(batch_size * num_events, num_tokens)
-        encoded = self.event_encoder(flat_hidden, attention_mask=flat_mask)
-        pooled = encoded[:, 0, :]
-        pooled = pooled.view(batch_size, num_events, self.d_model)
-
+        flat_cls = self.event_cls.expand(batch_size * num_events, -1, -1)
+        flat_hidden = torch.cat([flat_cls, flat_hidden], dim=1)
+        flat_mask = torch.cat(
+            [
+                torch.ones((batch_size, num_events, 1), dtype=torch.bool, device=event_key_ids.device),
+                event_token_mask.bool(),
+            ],
+            dim=2,
+        ).view(batch_size * num_events, num_tokens + 1)
+        encoded = self.event_encoder(flat_hidden, mask=flat_mask)
+        pooled = encoded[:, 0, :].view(batch_size, num_events, self.d_model)
         if calendar_features is not None:
             pooled = pooled + self.calendar_proj(calendar_features.to(pooled.dtype))
         return pooled
 
     def _encode_event_tokens(
         self,
-        event_input_ids: torch.Tensor,
-        event_attention_mask: torch.Tensor | None = None,
+        event_key_ids: torch.Tensor,
+        event_value_ids: torch.Tensor,
+        event_value_pos: torch.Tensor,
+        event_token_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, num_events, num_tokens = event_input_ids.shape
+        batch_size, num_events, num_tokens = event_key_ids.shape
         if num_events == 0:
-            empty_hidden = self.token_emb.weight.new_zeros((batch_size, 0, max(num_tokens - 1, 0), self.d_model))
-            empty_embed = self.token_emb.weight.new_zeros((batch_size, 0, self.d_model))
+            empty_hidden = event_key_ids.new_zeros((batch_size, 0, num_tokens, self.d_model), dtype=torch.float32)
+            empty_embed = event_key_ids.new_zeros((batch_size, 0, self.d_model), dtype=torch.float32)
             return empty_hidden, empty_embed
-
-        token_hidden = self.dropout(self.token_emb(event_input_ids))
+        token_hidden = self.kv_embedding(event_key_ids, event_value_ids, event_value_pos)
         flat_hidden = token_hidden.view(batch_size * num_events, num_tokens, self.d_model)
-        flat_mask = None
-        if event_attention_mask is not None:
-            flat_mask = event_attention_mask.view(batch_size * num_events, num_tokens)
-        encoded = self.event_encoder(flat_hidden, attention_mask=flat_mask)
-        encoded = encoded.view(batch_size, num_events, num_tokens, self.d_model)
-        local_hidden = encoded[:, :, 1:, :]
-        pooled = encoded[:, :, 0, :]
-        return local_hidden, pooled
+        flat_cls = self.event_cls.expand(batch_size * num_events, -1, -1)
+        flat_hidden = torch.cat([flat_cls, flat_hidden], dim=1)
+        flat_mask = torch.cat(
+            [
+                torch.ones((batch_size, num_events, 1), dtype=torch.bool, device=event_key_ids.device),
+                event_token_mask.bool(),
+            ],
+            dim=2,
+        ).view(batch_size * num_events, num_tokens + 1)
+        encoded = self.event_encoder(flat_hidden, mask=flat_mask)
+        encoded = encoded.view(batch_size, num_events, num_tokens + 1, self.d_model)
+        return encoded[:, :, 1:, :], encoded[:, :, 0, :]
 
     def _encode_history(
         self,
         profile_embedding: torch.Tensor,
         event_embeddings: torch.Tensor,
-        event_times: torch.Tensor | None = None,
+        event_time: torch.Tensor | None = None,
+        event_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         history_tokens = torch.cat([profile_embedding.unsqueeze(1), event_embeddings], dim=1)
-        if self.cfg.use_time_encoding and event_times is not None and event_embeddings.size(1) > 0:
-            time_bias = self.time_proj(event_times.unsqueeze(-1).to(history_tokens.dtype))
-            history_tokens[:, 1:, :] = history_tokens[:, 1:, :] + time_bias
-        history_mask = torch.ones(history_tokens.shape[:2], dtype=torch.bool, device=history_tokens.device)
-        history_hidden = self.history_encoder(history_tokens, attention_mask=history_mask)
+        batch_size = history_tokens.size(0)
+        if event_embeddings.size(1) > 0:
+            order = torch.arange(1, event_embeddings.size(1) + 1, device=history_tokens.device)
+            history_tokens[:, 1:, :] = history_tokens[:, 1:, :] + self.history_order_emb(order)[None, :, :]
+        if event_time is not None and event_embeddings.size(1) > 0:
+            history_tokens[:, 1:, :] = history_tokens[:, 1:, :] + self.time_proj(
+                event_time.unsqueeze(-1).to(history_tokens.dtype)
+            )
+        if event_mask is None:
+            history_mask = torch.ones(history_tokens.shape[:2], dtype=torch.bool, device=history_tokens.device)
+        else:
+            history_mask = torch.cat(
+                [torch.ones((batch_size, 1), dtype=torch.bool, device=history_tokens.device), event_mask.bool()],
+                dim=1,
+            )
+        positions = self._prepend_positions(event_time, batch_size=batch_size, device=history_tokens.device)
+        history_hidden = self.history_encoder(history_tokens, mask=history_mask, positions=positions)
         return history_hidden[:, 0, :], history_hidden[:, 1:, :]
 
     def _mlm_logits(
@@ -319,58 +376,53 @@ class PragmaLiteModel(nn.Module):
         event_context: torch.Tensor,
         user_context: torch.Tensor,
     ) -> torch.Tensor:
-        user_context = user_context.unsqueeze(1).expand_as(local_context)
-        fused = torch.cat([local_context, event_context, user_context], dim=-1)
-        return self.mlm_head(fused)
-
-    def _structured_mlm_logits_from_outputs(
-        self,
-        outputs: dict[str, torch.Tensor],
-        event_input_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        batch_size, num_events, num_tokens = event_input_ids.shape
-        local_context = self.token_emb.weight.new_zeros((batch_size, num_events, num_tokens, self.d_model))
-        local_context[:, :, 0, :] = outputs["event_embeddings"]
-        if num_tokens > 1:
-            local_context[:, :, 1:, :] = outputs["event_token_hidden"]
-        event_context = outputs["history_event_hidden"].unsqueeze(2).expand(-1, -1, num_tokens, -1)
-        user_context = outputs["history_embedding"].unsqueeze(1).unsqueeze(2).expand_as(local_context)
+        if local_context.ndim == 4:
+            user_context = user_context.unsqueeze(1).unsqueeze(2).expand_as(local_context)
+        elif local_context.ndim == 3:
+            user_context = user_context.unsqueeze(1).expand_as(local_context)
+        else:
+            raise ValueError(f"Unsupported local_context rank: {local_context.ndim}")
         fused = torch.cat([local_context, event_context, user_context], dim=-1)
         return self.mlm_head(fused)
 
     def forward(
         self,
-        profile_input_ids: torch.Tensor,
-        event_input_ids: torch.Tensor,
-        event_times: torch.Tensor | None = None,
+        profile_key_ids: torch.Tensor,
+        profile_value_ids: torch.Tensor,
+        profile_value_pos: torch.Tensor,
+        profile_time: torch.Tensor | None = None,
+        profile_mask: torch.Tensor | None = None,
+        event_key_ids: torch.Tensor | None = None,
+        event_value_ids: torch.Tensor | None = None,
+        event_value_pos: torch.Tensor | None = None,
+        event_token_mask: torch.Tensor | None = None,
+        event_time: torch.Tensor | None = None,
         calendar_features: torch.Tensor | None = None,
-        profile_attention_mask: torch.Tensor | None = None,
-        event_attention_mask: torch.Tensor | None = None,
+        event_mask: torch.Tensor | None = None,
         return_mlm_logits: bool = False,
     ) -> dict[str, torch.Tensor] | torch.Tensor:
-        if self.cfg.use_profile_encoder:
-            profile_embedding, profile_hidden = self._encode_profile(
-                profile_input_ids,
-                profile_attention_mask=profile_attention_mask,
-            )
-        else:
-            token_hidden = self.dropout(self.token_emb(profile_input_ids))
-            if profile_attention_mask is None:
-                profile_embedding = token_hidden.mean(dim=1)
-            else:
-                weights = profile_attention_mask.to(token_hidden.dtype).unsqueeze(-1)
-                profile_embedding = (token_hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
-            profile_hidden = token_hidden
-        event_token_hidden, event_embeddings = self._encode_event_tokens(
-            event_input_ids,
-            event_attention_mask=event_attention_mask,
+        if event_key_ids is None or event_value_ids is None or event_value_pos is None or event_token_mask is None:
+            raise ValueError("Structured event tensors are required: event_key_ids, event_value_ids, event_value_pos, event_token_mask")
+        profile_embedding, profile_hidden = self._encode_profile(
+            profile_key_ids=profile_key_ids,
+            profile_value_ids=profile_value_ids,
+            profile_value_pos=profile_value_pos,
+            profile_time=profile_time,
+            profile_mask=profile_mask,
         )
-        if calendar_features is not None and event_embeddings.size(1) > 0:
+        event_token_hidden, event_embeddings = self._encode_event_tokens(
+            event_key_ids=event_key_ids,
+            event_value_ids=event_value_ids,
+            event_value_pos=event_value_pos,
+            event_token_mask=event_token_mask,
+        )
+        if calendar_features is not None:
             event_embeddings = event_embeddings + self.calendar_proj(calendar_features.to(event_embeddings.dtype))
         history_embedding, history_event_hidden = self._encode_history(
             profile_embedding=profile_embedding,
             event_embeddings=event_embeddings,
-            event_times=event_times,
+            event_time=event_time,
+            event_mask=event_mask,
         )
         record_embedding = self.fusion(torch.cat([profile_embedding, history_embedding], dim=-1))
         outputs = {
@@ -385,127 +437,10 @@ class PragmaLiteModel(nn.Module):
             "event_token_hidden": event_token_hidden,
         }
         if return_mlm_logits:
-            return self._structured_mlm_logits_from_outputs(outputs, event_input_ids)
+            event_context = history_event_hidden.unsqueeze(2).expand_as(event_token_hidden)
+            return self._mlm_logits(event_token_hidden, event_context, history_embedding)
         return outputs
 
     def cls_logits(self, hidden_states: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
-        if isinstance(hidden_states, dict):
-            hidden = hidden_states["record_embedding"]
-        else:
-            hidden = hidden_states[:, 0, :]
+        hidden = hidden_states["record_embedding"] if isinstance(hidden_states, dict) else hidden_states
         return self.cls_head(hidden).squeeze(-1)
-
-
-class PragmaLite(PragmaLiteModel):
-    def __init__(self, cfg: PragmaLiteConfig) -> None:
-        super().__init__(cfg)
-        self.usr_id = 3
-        self.evt_id = 4
-
-    def _split_flat_inputs(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        bsz, seq_len = input_ids.shape
-        if seq_len > self.cfg.max_seq_len:
-            raise ValueError(f"seq_len={seq_len} exceeds max_seq_len={self.cfg.max_seq_len}")
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-
-        device = input_ids.device
-        profile_ids = torch.zeros((bsz, self.cfg.max_profile_tokens), dtype=torch.long, device=device)
-        profile_mask = torch.zeros((bsz, self.cfg.max_profile_tokens), dtype=torch.bool, device=device)
-        event_ids = torch.zeros(
-            (bsz, self.cfg.max_events, self.cfg.max_event_tokens),
-            dtype=torch.long,
-            device=device,
-        )
-        event_mask = torch.zeros(
-            (bsz, self.cfg.max_events, self.cfg.max_event_tokens),
-            dtype=torch.bool,
-            device=device,
-        )
-        token_event_index = torch.full((bsz, seq_len), -1, dtype=torch.long, device=device)
-        token_is_valid = attention_mask.bool()
-
-        for batch_idx in range(bsz):
-            valid_len = int(token_is_valid[batch_idx].sum().item())
-            flat = input_ids[batch_idx, :valid_len].tolist()
-            if not flat:
-                continue
-            evt_positions = [idx for idx, token in enumerate(flat) if token == self.evt_id]
-            profile_tokens = flat[1 : evt_positions[0]] if evt_positions else flat[1:]
-            profile_tokens = profile_tokens[: self.cfg.max_profile_tokens]
-            if profile_tokens:
-                profile_ids[batch_idx, : len(profile_tokens)] = torch.tensor(profile_tokens, device=device)
-                profile_mask[batch_idx, : len(profile_tokens)] = True
-
-            for event_idx, start in enumerate(evt_positions[: self.cfg.max_events]):
-                stop = evt_positions[event_idx + 1] if event_idx + 1 < len(evt_positions) else valid_len
-                tokens = flat[start:stop][: self.cfg.max_event_tokens]
-                if not tokens:
-                    continue
-                event_ids[batch_idx, event_idx, : len(tokens)] = torch.tensor(tokens, device=device)
-                event_mask[batch_idx, event_idx, : len(tokens)] = True
-                token_event_index[batch_idx, start : start + len(tokens)] = event_idx
-
-        return {
-            "profile_input_ids": profile_ids,
-            "profile_attention_mask": profile_mask,
-            "event_input_ids": event_ids,
-            "event_attention_mask": event_mask,
-            "token_event_index": token_event_index,
-            "token_is_valid": token_is_valid,
-        }
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        return_mlm_logits: bool = False,
-    ) -> torch.Tensor:
-        pieces = self._split_flat_inputs(input_ids, attention_mask=attention_mask)
-        outputs = super().forward(
-            profile_input_ids=pieces["profile_input_ids"],
-            event_input_ids=pieces["event_input_ids"],
-            event_times=None,
-            calendar_features=None,
-            profile_attention_mask=pieces["profile_attention_mask"],
-            event_attention_mask=pieces["event_attention_mask"],
-        )
-
-        bsz, seq_len = input_ids.shape
-        hidden = self.token_emb.weight.new_zeros((bsz, seq_len, self.d_model))
-        hidden[:, 0, :] = outputs["record_embedding"]
-        local_context = hidden.clone()
-        event_context = hidden.clone()
-
-        profile_hidden = outputs["profile_hidden"]
-        if profile_hidden.size(1) > 0:
-            profile_len = profile_hidden.size(1)
-            local_context[:, 1 : 1 + profile_len, :] = profile_hidden
-            event_context[:, 1 : 1 + profile_len, :] = outputs["profile_embedding"].unsqueeze(1)
-
-        event_token_hidden = outputs["event_token_hidden"]
-        history_event_hidden = outputs["history_event_hidden"]
-        token_event_index = pieces["token_event_index"]
-        for batch_idx in range(bsz):
-            valid_positions = pieces["token_is_valid"][batch_idx].nonzero(as_tuple=False).flatten()
-            for pos in valid_positions.tolist():
-                event_idx = int(token_event_index[batch_idx, pos].item())
-                if event_idx < 0:
-                    continue
-                event_positions = (token_event_index[batch_idx] == event_idx).nonzero(as_tuple=False).flatten()
-                token_offset = int((event_positions == pos).nonzero(as_tuple=False).item())
-                if token_offset == 0:
-                    local_context[batch_idx, pos, :] = outputs["event_embeddings"][batch_idx, event_idx, :]
-                elif token_offset - 1 < event_token_hidden.size(2):
-                    local_context[batch_idx, pos, :] = event_token_hidden[batch_idx, event_idx, token_offset - 1, :]
-                event_context[batch_idx, pos, :] = history_event_hidden[batch_idx, event_idx, :]
-
-        if return_mlm_logits:
-            return self._mlm_logits(local_context, event_context, outputs["record_embedding"])
-
-        hidden[:, 1:, :] = local_context[:, 1:, :]
-        return hidden

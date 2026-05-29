@@ -14,42 +14,16 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from src.common.yaml_utils import load_yaml
-from src.model.pragma_lite.model import PragmaLite, PragmaLiteConfig, PragmaLiteModel
+from src.model.pragma_lite.model import PragmaLiteConfig, PragmaLiteModel
+from src.tokenizer.masking import MaskedEventCollator
 from src.tokenizer.vocab import TokenizerVocab
 from src.training.checkpoint import save_checkpoint
-from src.training.data import TokenizedDataset, pad_collate, read_ids, set_seed
+from src.training.data import TokenizedDataset, read_ids, set_seed
 
 
 def _guess_tokenizer_dir(data_dir: Path) -> Path:
     candidate = data_dir.parent / "tokenizer"
     return candidate
-
-
-def _make_mlm_batch(
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    mask_id: int,
-    pad_id: int,
-    special_ids: set[int],
-    mask_prob: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    bsz, seq_len = input_ids.shape
-    labels = torch.full((bsz, seq_len), -100, dtype=torch.long, device=input_ids.device)
-
-    eligible = attention_mask.bool()
-    for sid in special_ids:
-        eligible = eligible & (input_ids != sid)
-    eligible = eligible & (input_ids != pad_id)
-
-    mask = (torch.rand((bsz, seq_len), device=input_ids.device) < mask_prob) & eligible
-    if eligible.any() and not mask.any():
-        first_valid = eligible.view(-1).nonzero(as_tuple=False)[0, 0]
-        mask.view(-1)[first_valid] = True
-    labels[mask] = input_ids[mask]
-
-    masked_input = input_ids.clone()
-    masked_input[mask] = mask_id
-    return masked_input, labels
 
 
 def _is_distributed() -> bool:
@@ -62,31 +36,6 @@ def _is_main_process() -> bool:
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
-
-
-def _make_structured_mlm_batch(
-    event_input_ids: torch.Tensor,
-    event_attention_mask: torch.Tensor,
-    mask_id: int,
-    pad_id: int,
-    special_ids: set[int],
-    mask_prob: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    labels = torch.full_like(event_input_ids, -100)
-    eligible = event_attention_mask.bool()
-    for sid in special_ids:
-        eligible = eligible & (event_input_ids != sid)
-    eligible = eligible & (event_input_ids != pad_id)
-
-    mask = (torch.rand(event_input_ids.shape, device=event_input_ids.device) < mask_prob) & eligible
-    if eligible.any() and not mask.any():
-        first_valid = eligible.view(-1).nonzero(as_tuple=False)[0, 0]
-        mask.view(-1)[first_valid] = True
-    labels[mask] = event_input_ids[mask]
-
-    masked_input = event_input_ids.clone()
-    masked_input[mask] = mask_id
-    return masked_input, labels
 
 
 def _setup_device(requested_device: str, backend: str) -> tuple[torch.device, int | None]:
@@ -109,45 +58,33 @@ def _evaluate(
     model: nn.Module,
     valid_loader: DataLoader,
     loss_fn: nn.Module,
-    vocab: TokenizerVocab,
-    mask_prob: float,
     device: torch.device,
 ) -> float:
     losses: list[float] = []
     with torch.no_grad():
         for batch in valid_loader:
-            if batch.has_structured_inputs:
-                masked_event_input_ids, mlm_labels = _make_structured_mlm_batch(
-                    event_input_ids=batch.event_input_ids.to(device, non_blocking=True),
-                    event_attention_mask=batch.event_attention_mask.to(device, non_blocking=True),
-                    mask_id=vocab.mask_id,
-                    pad_id=vocab.pad_id,
-                    special_ids={vocab.evt_id},
-                    mask_prob=mask_prob,
-                )
-                logits = model(
-                    profile_input_ids=batch.profile_input_ids.to(device, non_blocking=True),
-                    event_input_ids=masked_event_input_ids,
-                    event_times=batch.event_times.to(device, non_blocking=True),
-                    calendar_features=batch.calendar_features.to(device, non_blocking=True),
-                    profile_attention_mask=batch.profile_attention_mask.to(device, non_blocking=True),
-                    event_attention_mask=batch.event_attention_mask.to(device, non_blocking=True),
-                    return_mlm_logits=True,
-                )
-                loss = loss_fn(logits.view(-1, logits.size(-1)), mlm_labels.view(-1))
-            else:
-                input_ids = batch.input_ids.to(device, non_blocking=True)
-                attention_mask = batch.attention_mask.to(device, non_blocking=True)
-                masked_input, mlm_labels = _make_mlm_batch(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    mask_id=vocab.mask_id,
-                    pad_id=vocab.pad_id,
-                    special_ids={vocab.usr_id, vocab.evt_id},
-                    mask_prob=mask_prob,
-                )
-                logits = model(masked_input, attention_mask=attention_mask, return_mlm_logits=True)
-                loss = loss_fn(logits.view(-1, logits.size(-1)), mlm_labels.view(-1))
+            model_inputs = {
+                key: value.to(device, non_blocking=True)
+                for key, value in batch.items()
+                if key
+                in {
+                    "profile_key_ids",
+                    "profile_value_ids",
+                    "profile_value_pos",
+                    "profile_time",
+                    "profile_mask",
+                    "event_key_ids",
+                    "event_value_ids",
+                    "event_value_pos",
+                    "event_token_mask",
+                    "event_time",
+                    "calendar_features",
+                    "event_mask",
+                }
+            }
+            logits = model(**model_inputs, return_mlm_logits=True)
+            mlm_labels = batch["mlm_labels"].to(device, non_blocking=True)
+            loss = loss_fn(logits.view(-1, logits.size(-1)), mlm_labels.view(-1))
             losses.append(float(loss.item()))
     return float(np.mean(losses)) if losses else float("inf")
 
@@ -186,7 +123,6 @@ def main() -> None:
         n_layers=int(model_cfg.get("n_layers", 4)),
         d_ffn=int(model_cfg.get("d_ffn", int(model_cfg.get("d_model", 192)) * 4)),
         dropout=float(model_cfg.get("dropout", 0.1)),
-        max_seq_len=int(model_cfg.get("max_seq_len", 4096)),
         max_profile_tokens=int(model_cfg.get("max_profile_tokens", 200)),
         max_event_tokens=int(model_cfg.get("max_event_tokens", 24)),
         max_events=int(model_cfg.get("max_events", 512)),
@@ -198,9 +134,7 @@ def main() -> None:
     valid_ids = read_ids(split_dir / "valid_ids.txt")
     train_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=train_ids)
     valid_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=valid_ids)
-
-    model_cls = PragmaLiteModel if train_ds.has_structured_inputs else PragmaLite
-    model: nn.Module = model_cls(cfg).to(device)
+    model: nn.Module = PragmaLiteModel(cfg).to(device)
     if _is_distributed():
         model = DDP(
             model,
@@ -244,7 +178,49 @@ def main() -> None:
 
     max_steps = int(train_cfg["training"].get("max_steps", 1000))
     log_every = int(train_cfg["training"].get("log_every", 50))
-    mask_prob = float(train_cfg.get("masking", {}).get("token_mask_prob", 0.15))
+    masking_cfg = train_cfg.get("masking", {})
+    train_collator = MaskedEventCollator(
+        mask_token_id=vocab.mask_id,
+        unk_token_id=vocab.unk_id,
+        pad_token_id=vocab.pad_id,
+        token_mask_probability=float(masking_cfg.get("token_mask_prob", 0.15)),
+        event_mask_probability=float(masking_cfg.get("event_mask_prob", 0.10)),
+        key_mask_probability=float(masking_cfg.get("key_mask_prob", 0.10)),
+        unk_probability=float(masking_cfg.get("unk_prob", 0.10)),
+        seed=seed,
+    )
+    valid_collator = MaskedEventCollator(
+        mask_token_id=vocab.mask_id,
+        unk_token_id=vocab.unk_id,
+        pad_token_id=vocab.pad_id,
+        token_mask_probability=float(masking_cfg.get("token_mask_prob", 0.15)),
+        event_mask_probability=float(masking_cfg.get("event_mask_prob", 0.10)),
+        key_mask_probability=float(masking_cfg.get("key_mask_prob", 0.10)),
+        unk_probability=float(masking_cfg.get("unk_prob", 0.10)),
+        seed=seed + 1,
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        collate_fn=train_collator,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
+    valid_loader = None
+    if not _is_distributed() or is_main:
+        valid_loader = DataLoader(
+            valid_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=valid_collator,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=num_workers > 0,
+        )
 
     best_valid = float("inf")
     step = 0
@@ -258,40 +234,28 @@ def main() -> None:
             for batch in train_loader:
                 if step >= max_steps:
                     break
-                if batch.has_structured_inputs:
-                    masked_event_input_ids, mlm_labels = _make_structured_mlm_batch(
-                        event_input_ids=batch.event_input_ids.to(device, non_blocking=True),
-                        event_attention_mask=batch.event_attention_mask.to(device, non_blocking=True),
-                        mask_id=vocab.mask_id,
-                        pad_id=vocab.pad_id,
-                        special_ids={vocab.evt_id},
-                        mask_prob=mask_prob,
-                    )
-                    logits = model(
-                        profile_input_ids=batch.profile_input_ids.to(device, non_blocking=True),
-                        event_input_ids=masked_event_input_ids,
-                        event_times=batch.event_times.to(device, non_blocking=True),
-                        calendar_features=batch.calendar_features.to(device, non_blocking=True),
-                        profile_attention_mask=batch.profile_attention_mask.to(device, non_blocking=True),
-                        event_attention_mask=batch.event_attention_mask.to(device, non_blocking=True),
-                        return_mlm_logits=True,
-                    )
-                    loss = loss_fn(logits.view(-1, logits.size(-1)), mlm_labels.view(-1))
-                else:
-                    input_ids = batch.input_ids.to(device, non_blocking=True)
-                    attention_mask = batch.attention_mask.to(device, non_blocking=True)
-
-                    masked_input, mlm_labels = _make_mlm_batch(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        mask_id=vocab.mask_id,
-                        pad_id=vocab.pad_id,
-                        special_ids={vocab.usr_id, vocab.evt_id},
-                        mask_prob=mask_prob,
-                    )
-
-                    logits = model(masked_input, attention_mask=attention_mask, return_mlm_logits=True)
-                    loss = loss_fn(logits.view(-1, logits.size(-1)), mlm_labels.view(-1))
+                model_inputs = {
+                    key: value.to(device, non_blocking=True)
+                    for key, value in batch.items()
+                    if key
+                    in {
+                        "profile_key_ids",
+                        "profile_value_ids",
+                        "profile_value_pos",
+                        "profile_time",
+                        "profile_mask",
+                        "event_key_ids",
+                        "event_value_ids",
+                        "event_value_pos",
+                        "event_token_mask",
+                        "event_time",
+                        "calendar_features",
+                        "event_mask",
+                    }
+                }
+                mlm_labels = batch["mlm_labels"].to(device, non_blocking=True)
+                logits = model(**model_inputs, return_mlm_logits=True)
+                loss = loss_fn(logits.view(-1, logits.size(-1)), mlm_labels.view(-1))
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -310,8 +274,6 @@ def main() -> None:
                             model=model,
                             valid_loader=valid_loader,
                             loss_fn=loss_fn,
-                            vocab=vocab,
-                            mask_prob=mask_prob,
                             device=device,
                         )
                         if valid_loss < best_valid:

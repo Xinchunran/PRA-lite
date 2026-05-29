@@ -45,7 +45,7 @@ def main() -> None:
             next_id += 1
 
     for col in profile_cols:
-        add_token(f"KP:{col}")
+        add_token(f"K:P:{col}")
         if _is_numeric(profiles[col]):
             values = profiles[col].dropna().astype("float64")
             if len(values) > 0:
@@ -54,15 +54,15 @@ def main() -> None:
                 edges = []
             numeric_binners[f"P:{col}"] = NumericBinner(edges=edges)
             for b in range(args.num_buckets + 1):
-                add_token(f"VP:{col}#B{b}")
+                add_token(f"V:P:{col}#B{b}")
         else:
             counts = Counter(profiles[col].astype("string").fillna("[NA]").tolist())
             for v, c in counts.items():
                 if c >= args.min_freq:
-                    add_token(f"VP:{col}={v}")
+                    add_token(f"V:P:{col}={v}")
 
     for col in event_cols:
-        add_token(f"KE:{col}")
+        add_token(f"K:E:{col}")
         if _is_numeric(events[col]):
             values = events[col].dropna().astype("float64")
             if len(values) > 0:
@@ -71,16 +71,12 @@ def main() -> None:
                 edges = []
             numeric_binners[f"E:{col}"] = NumericBinner(edges=edges)
             for b in range(args.num_buckets + 1):
-                add_token(f"VE:{col}#B{b}")
+                add_token(f"V:E:{col}#B{b}")
         else:
             counts = Counter(events[col].astype("string").fillna("[NA]").tolist())
             for v, c in counts.items():
                 if c >= args.min_freq:
-                    add_token(f"VE:{col}={v}")
-
-    add_token("KE:time_delta")
-    for b in range(32):
-        add_token(f"VE:time_delta#B{b}")
+                    add_token(f"V:E:{col}={v}")
 
     vocab = TokenizerVocab(
         token_to_id=token_to_id,

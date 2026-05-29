@@ -25,15 +25,21 @@ def _make_model() -> PragmaLiteModel:
 
 def _make_batch() -> dict[str, torch.Tensor]:
     return {
-        "profile_input_ids": torch.tensor([[11, 12, 13]], dtype=torch.long),
-        "profile_attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.bool),
-        "event_input_ids": torch.tensor([[[4, 21, 22, 23], [4, 31, 32, 33]]], dtype=torch.long),
-        "event_attention_mask": torch.tensor([[[1, 1, 1, 1], [1, 1, 1, 1]]], dtype=torch.bool),
-        "event_times": torch.tensor([[100.0, 10.0]], dtype=torch.float32),
+        "profile_key_ids": torch.tensor([[11, 12, 13]], dtype=torch.long),
+        "profile_value_ids": torch.tensor([[41, 42, 43]], dtype=torch.long),
+        "profile_value_pos": torch.tensor([[0, 0, 0]], dtype=torch.long),
+        "profile_time": torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32),
+        "profile_mask": torch.tensor([[1, 1, 1]], dtype=torch.bool),
+        "event_key_ids": torch.tensor([[[21, 22, 23], [31, 32, 33]]], dtype=torch.long),
+        "event_value_ids": torch.tensor([[[51, 52, 53], [61, 62, 63]]], dtype=torch.long),
+        "event_value_pos": torch.tensor([[[0, 0, 0], [0, 0, 0]]], dtype=torch.long),
+        "event_token_mask": torch.tensor([[[1, 1, 1], [1, 1, 1]]], dtype=torch.bool),
+        "event_time": torch.tensor([[100.0, 10.0]], dtype=torch.float32),
         "calendar_features": torch.tensor(
             [[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [6.0, 5.0, 4.0, 3.0, 2.0, 1.0]]],
             dtype=torch.float32,
         ),
+        "event_mask": torch.tensor([[1, 1]], dtype=torch.bool),
     }
 
 
@@ -60,7 +66,7 @@ def test_event_encoder_splits_evt_token_from_local_token_hidden() -> None:
     with torch.no_grad():
         out = model(**batch)
 
-    assert out["event_token_hidden"].shape == (1, 2, batch["event_input_ids"].size(-1) - 1, model.d_model)
+    assert out["event_token_hidden"].shape == (1, 2, batch["event_key_ids"].size(-1), model.d_model)
     assert out["event_embeddings"].shape == (1, 2, model.d_model)
 
 
@@ -72,10 +78,13 @@ def test_history_event_hidden_changes_when_event_order_changes() -> None:
         base = model(**batch)["history_event_hidden"]
 
     swapped = dict(batch)
-    swapped["event_input_ids"] = batch["event_input_ids"].flip(1)
-    swapped["event_attention_mask"] = batch["event_attention_mask"].flip(1)
-    swapped["event_times"] = batch["event_times"].flip(1)
+    swapped["event_key_ids"] = batch["event_key_ids"].flip(1)
+    swapped["event_value_ids"] = batch["event_value_ids"].flip(1)
+    swapped["event_value_pos"] = batch["event_value_pos"].flip(1)
+    swapped["event_token_mask"] = batch["event_token_mask"].flip(1)
+    swapped["event_time"] = batch["event_time"].flip(1)
     swapped["calendar_features"] = batch["calendar_features"].flip(1)
+    swapped["event_mask"] = batch["event_mask"].flip(1)
     with torch.no_grad():
         changed = model(**swapped)["history_event_hidden"]
 

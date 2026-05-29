@@ -22,13 +22,13 @@ def _write_tokenizer(tokenizer_dir: Path) -> None:
             "[MASK]": 2,
             "[USR]": 3,
             "[EVT]": 4,
-            "KP:region": 5,
-            "VP:region=uk": 6,
-            "VP:region=fr": 7,
-            "KE:merchant": 8,
-            "VE:merchant=a": 9,
-            "VE:merchant=b": 10,
-            "VE:merchant=c": 11,
+            "K:P:region": 5,
+            "V:P:region=uk": 6,
+            "V:P:region=fr": 7,
+            "K:E:merchant": 8,
+            "V:E:merchant=a": 9,
+            "V:E:merchant=b": 10,
+            "V:E:merchant=c": 11,
         },
         "profile_cols": ["region"],
         "event_cols": ["merchant"],
@@ -98,17 +98,22 @@ def test_encode_dataset_writes_structured_columns(tmp_path: Path, monkeypatch) -
 
     df = pd.read_parquet(output_dir / "dataset.parquet")
     assert {
-        "profile_input_ids",
-        "profile_attention_mask",
-        "event_input_ids",
-        "event_attention_mask",
-        "event_times",
+        "profile_key_ids",
+        "profile_value_ids",
+        "profile_value_pos",
+        "profile_time",
+        "profile_mask",
+        "event_key_ids",
+        "event_value_ids",
+        "event_value_pos",
+        "event_token_mask",
+        "event_time",
         "calendar_features",
         "event_mask",
     }.issubset(df.columns)
-    assert len(df.loc[0, "profile_input_ids"]) == 4
-    assert len(df.loc[0, "event_input_ids"]) == 3
-    assert len(df.loc[0, "event_input_ids"][0]) == 4
+    assert len(df.loc[0, "profile_key_ids"]) == 4
+    assert len(df.loc[0, "event_key_ids"]) == 3
+    assert len(df.loc[0, "event_key_ids"][0]) == 4
     assert len(df.loc[0, "calendar_features"][0]) == 6
 
 
@@ -144,15 +149,20 @@ def test_dataloader_returns_structured_batch_and_direct_model_inputs(tmp_path: P
 
     ds = TokenizedDataset(output_dir / "dataset.parquet")
     batch = pad_collate([ds[0], ds[1]], pad_id=0)
-    assert batch.has_structured_inputs
     model_inputs = batch.model_inputs()
     assert set(model_inputs.keys()) == {
-        "profile_input_ids",
-        "event_input_ids",
-        "profile_attention_mask",
-        "event_attention_mask",
-        "event_times",
+        "profile_key_ids",
+        "profile_value_ids",
+        "profile_value_pos",
+        "profile_time",
+        "profile_mask",
+        "event_key_ids",
+        "event_value_ids",
+        "event_value_pos",
+        "event_token_mask",
+        "event_time",
         "calendar_features",
+        "event_mask",
     }
 
     model = PragmaLiteModel(
@@ -175,7 +185,7 @@ def test_dataloader_returns_structured_batch_and_direct_model_inputs(tmp_path: P
         out = model(**model_inputs)
         logits = model(**model_inputs, return_mlm_logits=True)
     assert out["record_embedding"].shape == (2, model.d_model)
-    assert logits.shape[:3] == batch.event_input_ids.shape
+    assert logits.shape[:3] == batch.event_value_ids.shape
 
 
 def test_pretrain_pipeline_runs_on_structured_only_dataset(tmp_path: Path, monkeypatch) -> None:
@@ -194,33 +204,48 @@ def test_pretrain_pipeline_runs_on_structured_only_dataset(tmp_path: Path, monke
         [
             {
                 "entity_id": 1,
-                "profile_input_ids": [5, 6, 0, 0],
-                "profile_attention_mask": [1, 1, 0, 0],
-                "event_input_ids": [[4, 8, 9, 0], [4, 8, 10, 0], [0, 0, 0, 0]],
-                "event_attention_mask": [[1, 1, 1, 0], [1, 1, 1, 0], [0, 0, 0, 0]],
-                "event_times": [1.0, 0.5, 0.0],
+                "profile_key_ids": [5, 0, 0, 0],
+                "profile_value_ids": [6, 0, 0, 0],
+                "profile_value_pos": [0, 0, 0, 0],
+                "profile_time": [0.0, 0.0, 0.0, 0.0],
+                "profile_mask": [1, 0, 0, 0],
+                "event_key_ids": [[8, 0, 0, 0], [8, 0, 0, 0], [0, 0, 0, 0]],
+                "event_value_ids": [[9, 0, 0, 0], [10, 0, 0, 0], [0, 0, 0, 0]],
+                "event_value_pos": [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+                "event_token_mask": [[1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]],
+                "event_time": [1.0, 0.5, 0.0],
                 "calendar_features": [[0.0] * 6, [1.0] * 6, [0.0] * 6],
                 "event_mask": [1, 1, 0],
                 "label": 0,
             },
             {
                 "entity_id": 2,
-                "profile_input_ids": [5, 7, 0, 0],
-                "profile_attention_mask": [1, 1, 0, 0],
-                "event_input_ids": [[4, 8, 10, 0], [4, 8, 11, 0], [0, 0, 0, 0]],
-                "event_attention_mask": [[1, 1, 1, 0], [1, 1, 1, 0], [0, 0, 0, 0]],
-                "event_times": [1.2, 0.3, 0.0],
+                "profile_key_ids": [5, 0, 0, 0],
+                "profile_value_ids": [7, 0, 0, 0],
+                "profile_value_pos": [0, 0, 0, 0],
+                "profile_time": [0.0, 0.0, 0.0, 0.0],
+                "profile_mask": [1, 0, 0, 0],
+                "event_key_ids": [[8, 0, 0, 0], [8, 0, 0, 0], [0, 0, 0, 0]],
+                "event_value_ids": [[10, 0, 0, 0], [11, 0, 0, 0], [0, 0, 0, 0]],
+                "event_value_pos": [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+                "event_token_mask": [[1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]],
+                "event_time": [1.2, 0.3, 0.0],
                 "calendar_features": [[1.0] * 6, [0.5] * 6, [0.0] * 6],
                 "event_mask": [1, 1, 0],
                 "label": 1,
             },
             {
                 "entity_id": 3,
-                "profile_input_ids": [5, 6, 0, 0],
-                "profile_attention_mask": [1, 1, 0, 0],
-                "event_input_ids": [[4, 8, 9, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
-                "event_attention_mask": [[1, 1, 1, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
-                "event_times": [0.8, 0.0, 0.0],
+                "profile_key_ids": [5, 0, 0, 0],
+                "profile_value_ids": [6, 0, 0, 0],
+                "profile_value_pos": [0, 0, 0, 0],
+                "profile_time": [0.0, 0.0, 0.0, 0.0],
+                "profile_mask": [1, 0, 0, 0],
+                "event_key_ids": [[8, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+                "event_value_ids": [[9, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+                "event_value_pos": [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+                "event_token_mask": [[1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+                "event_time": [0.8, 0.0, 0.0],
                 "calendar_features": [[0.2] * 6, [0.0] * 6, [0.0] * 6],
                 "event_mask": [1, 0, 0],
                 "label": 0,
@@ -261,7 +286,6 @@ def test_pretrain_pipeline_runs_on_structured_only_dataset(tmp_path: Path, monke
                 "  n_layers: 1",
                 "  d_ffn: 64",
                 "  dropout: 0.0",
-                "  max_seq_len: 32",
                 "  max_profile_tokens: 4",
                 "  max_event_tokens: 4",
                 "  max_events: 3",
