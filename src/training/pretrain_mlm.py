@@ -42,6 +42,9 @@ def _make_mlm_batch(
     eligible = eligible & (input_ids != pad_id)
 
     mask = (torch.rand((bsz, seq_len), device=input_ids.device) < mask_prob) & eligible
+    if eligible.any() and not mask.any():
+        first_valid = eligible.view(-1).nonzero(as_tuple=False)[0, 0]
+        mask.view(-1)[first_valid] = True
     labels[mask] = input_ids[mask]
 
     masked_input = input_ids.clone()
@@ -136,8 +139,15 @@ def main() -> None:
         d_model=int(model_cfg.get("d_model", 192)),
         n_heads=int(model_cfg.get("n_heads", 3)),
         n_layers=int(model_cfg.get("n_layers", 4)),
+        d_ffn=int(model_cfg.get("d_ffn", int(model_cfg.get("d_model", 192)) * 4)),
         dropout=float(model_cfg.get("dropout", 0.1)),
         max_seq_len=int(model_cfg.get("max_seq_len", 4096)),
+        max_profile_tokens=int(model_cfg.get("max_profile_tokens", 200)),
+        max_event_tokens=int(model_cfg.get("max_event_tokens", 24)),
+        max_events=int(model_cfg.get("max_events", 512)),
+        profile_layers=int(model_cfg.get("profile_layers", 1)),
+        event_layers=int(model_cfg.get("event_layers", int(model_cfg.get("n_layers", 4)))),
+        history_layers=int(model_cfg.get("history_layers", int(model_cfg.get("n_layers", 4)))),
     )
     model: nn.Module = PragmaLite(cfg).to(device)
     if _is_distributed():

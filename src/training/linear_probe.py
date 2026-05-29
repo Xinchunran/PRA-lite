@@ -44,12 +44,10 @@ def main() -> None:
     model.load_state_dict(ckpt["model_state"])
     model.to(args.device)
 
-    for p in model.encoder.parameters():
+    for p in model.parameters():
         p.requires_grad = False
-    for p in model.token_emb.parameters():
-        p.requires_grad = False
-    for p in model.pos_emb.parameters():
-        p.requires_grad = False
+    for p in model.cls_head.parameters():
+        p.requires_grad = True
 
     train_ids = read_ids(split_dir / "train_ids.txt")
     valid_ids = read_ids(split_dir / "valid_ids.txt")
