@@ -8,15 +8,49 @@ import pandas as pd
 from tqdm import tqdm
 
 from src.common.fs import ensure_dir, write_json
+from src.tokenizer.time import periodic_encode, soft_log_seconds
 from src.tokenizer.vocab import TokenizerVocab
 
 
-def _time_delta_bucket(delta_minutes: float | None) -> int:
-    if delta_minutes is None or not np.isfinite(delta_minutes) or delta_minutes < 0:
-        return 0
-    x = float(delta_minutes)
-    b = int(np.floor(np.log1p(x)))
-    return int(np.clip(b, 0, 31))
+def _calendar_features(ts: pd.Timestamp) -> list[float]:
+    hour = periodic_encode(np.array([ts.hour], dtype=np.float64), period=24.0)[0]
+    dow = periodic_encode(np.array([ts.dayofweek], dtype=np.float64), period=7.0)[0]
+    dom = periodic_encode(np.array([ts.day], dtype=np.float64), period=31.0)[0]
+    feats = np.concatenate([hour, dow, dom], axis=0)
+    return feats.astype(np.float32).tolist()
+
+
+def _event_time_feature(event_ts: pd.Timestamp, evaluation_ts: pd.Timestamp) -> float:
+    delta_seconds = max(0.0, (evaluation_ts - event_ts).total_seconds())
+    return float(soft_log_seconds(delta_seconds))
+
+
+def _pad_1d(values: list[int], length: int, pad_value: int = 0) -> tuple[list[int], list[int]]:
+    clipped = values[:length]
+    mask = [1] * len(clipped) + [0] * max(length - len(clipped), 0)
+    padded = clipped + [pad_value] * max(length - len(clipped), 0)
+    return padded, mask
+
+
+def _pad_2d(
+    rows: list[list[int]],
+    outer: int,
+    inner: int,
+    pad_value: int = 0,
+) -> tuple[list[list[int]], list[list[int]], list[int]]:
+    padded_rows: list[list[int]] = []
+    masks: list[list[int]] = []
+    row_mask: list[int] = []
+    for row in rows[:outer]:
+        padded_row, row_attn = _pad_1d(row, inner, pad_value=pad_value)
+        padded_rows.append(padded_row)
+        masks.append(row_attn)
+        row_mask.append(1)
+    while len(padded_rows) < outer:
+        padded_rows.append([pad_value] * inner)
+        masks.append([0] * inner)
+        row_mask.append(0)
+    return padded_rows, masks, row_mask
 
 
 def main() -> None:
@@ -51,13 +85,10 @@ def main() -> None:
         if entity_id not in profile_map.index or entity_id not in label_map.index:
             continue
 
-        tokens: list[int] = [vocab.usr_id]
-
         prof = profile_map.loc[entity_id]
         prof_tokens: list[int] = []
         for col in vocab.profile_cols:
-            key = f"KP:{col}"
-            prof_tokens.append(vocab.encode_token(key))
+            prof_tokens.append(vocab.encode_token(f"KP:{col}"))
             val = prof[col] if col in prof.index else None
             col_key = f"P:{col}"
             if col_key in vocab.numeric_binners:
@@ -68,27 +99,23 @@ def main() -> None:
                 v = "[NA]" if pd.isna(val) else str(val)
                 prof_tokens.append(vocab.encode_token(f"VP:{col}={v}"))
 
-        prof_tokens = prof_tokens[: args.max_profile_tokens]
-        tokens.extend(prof_tokens)
+        prof_input_ids, prof_mask = _pad_1d(prof_tokens, args.max_profile_tokens, pad_value=vocab.pad_id)
 
+        flat_tokens: list[int] = [vocab.usr_id]
+        flat_tokens.extend(prof_tokens[: args.max_profile_tokens])
+
+        evaluation_time = pd.to_datetime(label_map.loc[entity_id]["evaluation_time"], utc=True, errors="coerce")
+        if pd.isna(evaluation_time):
+            continue
         ev_df = ev_df.sort_values("timestamp", ascending=True).tail(args.max_events)
-        last_ts = None
+        event_rows: list[list[int]] = []
+        event_times: list[float] = []
+        calendar_rows: list[list[float]] = []
         for _, row in ev_df.iterrows():
             event_tokens: list[int] = [vocab.evt_id]
             ts = row["timestamp"]
-            if last_ts is None:
-                delta_min = None
-            else:
-                delta_min = (ts - last_ts).total_seconds() / 60.0
-            last_ts = ts
-
-            dt_bucket = _time_delta_bucket(delta_min)
-            event_tokens.append(vocab.encode_token("KE:time_delta"))
-            event_tokens.append(vocab.encode_token(f"VE:time_delta#B{dt_bucket}"))
-
             for col in vocab.event_cols:
-                key = f"KE:{col}"
-                event_tokens.append(vocab.encode_token(key))
+                event_tokens.append(vocab.encode_token(f"KE:{col}"))
                 val = row[col] if col in row.index else None
                 col_key = f"E:{col}"
                 if col_key in vocab.numeric_binners:
@@ -98,20 +125,37 @@ def main() -> None:
                 else:
                     v = "[NA]" if pd.isna(val) else str(val)
                     event_tokens.append(vocab.encode_token(f"VE:{col}={v}"))
-
                 if len(event_tokens) >= args.max_event_tokens:
                     break
+            event_tokens = event_tokens[: args.max_event_tokens]
+            event_rows.append(event_tokens)
+            event_times.append(_event_time_feature(ts, evaluation_time))
+            calendar_rows.append(_calendar_features(ts))
+            flat_tokens.extend(event_tokens)
 
-            tokens.extend(event_tokens[: args.max_event_tokens])
-
-        attention_mask = [1] * len(tokens)
+        event_input_ids, event_attention_mask, event_mask = _pad_2d(
+            event_rows,
+            outer=args.max_events,
+            inner=args.max_event_tokens,
+            pad_value=vocab.pad_id,
+        )
+        event_times = event_times[: args.max_events] + [0.0] * max(args.max_events - len(event_times), 0)
+        calendar_rows = calendar_rows[: args.max_events] + [[0.0] * 6] * max(args.max_events - len(calendar_rows), 0)
+        attention_mask = [1] * len(flat_tokens)
         rows.append(
             {
                 "entity_id": int(entity_id),
-                "input_ids": tokens,
+                "input_ids": flat_tokens,
                 "attention_mask": attention_mask,
+                "profile_input_ids": prof_input_ids,
+                "profile_attention_mask": prof_mask,
+                "event_input_ids": event_input_ids,
+                "event_attention_mask": event_attention_mask,
+                "event_times": event_times,
+                "calendar_features": calendar_rows,
+                "event_mask": event_mask,
                 "label": int(label_map.loc[entity_id]["label"]),
-                "evaluation_time": str(label_map.loc[entity_id]["evaluation_time"]),
+                "evaluation_time": str(evaluation_time),
             }
         )
 

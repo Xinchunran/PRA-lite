@@ -396,7 +396,10 @@ def _tiny_batch() -> Dict[str, Any]:
         "profile_input_ids": torch.tensor([[101, 201, 301]], dtype=torch.long),
         "event_input_ids": torch.tensor([[[11, 111, 12, 112, 13, 113], [21, 121, 22, 122, 23, 123]]], dtype=torch.long),
         "event_times": torch.tensor([[100.0, 10.0]], dtype=torch.float32),
-        "calendar_features": torch.tensor([[[12.0, 1.0, 2.0], [18.0, 3.0, 5.0]]], dtype=torch.float32),
+        "calendar_features": torch.tensor(
+            [[[12.0, 1.0, 2.0, 0.5, 0.6, 0.7], [18.0, 3.0, 5.0, 0.2, 0.3, 0.4]]],
+            dtype=torch.float32,
+        ),
     }
 
 

@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.model.pragma_lite.model import PragmaLite, PragmaLiteConfig
+from src.model.pragma_lite.model import PragmaLite, PragmaLiteConfig, PragmaLiteModel
 from src.tokenizer.vocab import TokenizerVocab
 from src.training.checkpoint import load_checkpoint
 from src.training.data import TokenizedDataset, pad_collate, read_ids
@@ -40,12 +40,6 @@ def main() -> None:
     tokenizer_dir = Path(ckpt["tokenizer_dir"])
     vocab = TokenizerVocab.load(tokenizer_dir)
 
-    cfg = PragmaLiteConfig(**ckpt["model_cfg"])
-    model = PragmaLite(cfg)
-    model.load_state_dict(ckpt["model_state"])
-    model.to(args.device)
-    model.eval()
-
     data_dir = Path(args.data_dir)
     ids = None
     if args.split != "all":
@@ -55,6 +49,12 @@ def main() -> None:
         ids = read_ids(split_dir / f"{args.split}_ids.txt")
 
     ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=ids)
+    cfg = PragmaLiteConfig(**ckpt["model_cfg"])
+    model_cls = PragmaLiteModel if ds.has_structured_inputs else PragmaLite
+    model = model_cls(cfg)
+    model.load_state_dict(ckpt["model_state"])
+    model.to(args.device)
+    model.eval()
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -66,12 +66,11 @@ def main() -> None:
     out_rows = []
     with torch.no_grad():
         for batch in tqdm(loader, desc="predict"):
-            input_ids = batch.input_ids.to(args.device)
-            attention_mask = batch.attention_mask.to(args.device)
             labels = batch.labels.detach().cpu().numpy() if batch.labels is not None else None
             entity_ids = batch.entity_id.detach().cpu().numpy()
 
-            h = model(input_ids, attention_mask=attention_mask)
+            model_inputs = {key: value.to(args.device) for key, value in batch.model_inputs().items() if value is not None}
+            h = model(**model_inputs)
             logits = model.cls_logits(h).detach().cpu().numpy()
             prob = 1.0 / (1.0 + np.exp(-logits))
             pred = (prob >= 0.5).astype(np.int64)

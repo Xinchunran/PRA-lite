@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.model.pragma_lite.model import PragmaLite, PragmaLiteConfig
+from src.model.pragma_lite.model import PragmaLite, PragmaLiteConfig, PragmaLiteModel
 from src.tokenizer.vocab import TokenizerVocab
 from src.training.checkpoint import load_checkpoint, save_checkpoint
 from src.training.data import TokenizedDataset, pad_collate, read_ids, set_seed
@@ -35,12 +35,18 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    train_ids = read_ids(split_dir / "train_ids.txt")
+    valid_ids = read_ids(split_dir / "valid_ids.txt")
+    train_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=train_ids)
+    valid_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=valid_ids)
+
     ckpt = load_checkpoint(Path(args.checkpoint), map_location=args.device)
     tokenizer_dir = Path(ckpt["tokenizer_dir"])
     vocab = TokenizerVocab.load(tokenizer_dir)
 
     cfg = PragmaLiteConfig(**ckpt["model_cfg"])
-    model = PragmaLite(cfg)
+    model_cls = PragmaLiteModel if train_ds.has_structured_inputs else PragmaLite
+    model = model_cls(cfg)
     model.load_state_dict(ckpt["model_state"])
     model.to(args.device)
 
@@ -48,11 +54,6 @@ def main() -> None:
         p.requires_grad = False
     for p in model.cls_head.parameters():
         p.requires_grad = True
-
-    train_ids = read_ids(split_dir / "train_ids.txt")
-    valid_ids = read_ids(split_dir / "valid_ids.txt")
-    train_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=train_ids)
-    valid_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=valid_ids)
 
     train_loader = DataLoader(
         train_ds,
@@ -76,14 +77,15 @@ def main() -> None:
     for epoch in range(args.max_epochs):
         model.train()
         for batch in tqdm(train_loader, desc=f"probe epoch {epoch+1}/{args.max_epochs}"):
-            input_ids = batch.input_ids.to(args.device)
-            attention_mask = batch.attention_mask.to(args.device)
             labels = batch.labels.to(args.device) if batch.labels is not None else None
             if labels is None:
                 raise ValueError("Tokenized dataset must include label for linear_probe")
 
             with torch.no_grad():
-                h = model(input_ids, attention_mask=attention_mask)
+                model_inputs = {
+                    key: value.to(args.device) for key, value in batch.model_inputs().items() if value is not None
+                }
+                h = model(**model_inputs)
             logits = model.cls_logits(h)
             loss = loss_fn(logits, labels)
 
@@ -96,10 +98,11 @@ def main() -> None:
             all_logits = []
             all_labels = []
             for batch in valid_loader:
-                input_ids = batch.input_ids.to(args.device)
-                attention_mask = batch.attention_mask.to(args.device)
                 labels = batch.labels.to(args.device)
-                h = model(input_ids, attention_mask=attention_mask)
+                model_inputs = {
+                    key: value.to(args.device) for key, value in batch.model_inputs().items() if value is not None
+                }
+                h = model(**model_inputs)
                 logits = model.cls_logits(h)
                 all_logits.append(logits.detach().cpu().numpy())
                 all_labels.append(labels.detach().cpu().numpy())

@@ -218,7 +218,7 @@ class PragmaLiteModel(nn.Module):
             use_rope=True,
             rope_base=cfg.rope_base,
         )
-        self.calendar_proj = nn.Linear(3, self.d_model)
+        self.calendar_proj = nn.Linear(6, self.d_model)
         self.time_proj = nn.Sequential(nn.Linear(1, self.d_model), nn.Tanh())
         self.fusion = nn.Sequential(
             nn.Linear(self.d_model * 2, self.d_model),
@@ -323,6 +323,21 @@ class PragmaLiteModel(nn.Module):
         fused = torch.cat([local_context, event_context, user_context], dim=-1)
         return self.mlm_head(fused)
 
+    def _structured_mlm_logits_from_outputs(
+        self,
+        outputs: dict[str, torch.Tensor],
+        event_input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, num_events, num_tokens = event_input_ids.shape
+        local_context = self.token_emb.weight.new_zeros((batch_size, num_events, num_tokens, self.d_model))
+        local_context[:, :, 0, :] = outputs["event_embeddings"]
+        if num_tokens > 1:
+            local_context[:, :, 1:, :] = outputs["event_token_hidden"]
+        event_context = outputs["history_event_hidden"].unsqueeze(2).expand(-1, -1, num_tokens, -1)
+        user_context = outputs["history_embedding"].unsqueeze(1).unsqueeze(2).expand_as(local_context)
+        fused = torch.cat([local_context, event_context, user_context], dim=-1)
+        return self.mlm_head(fused)
+
     def forward(
         self,
         profile_input_ids: torch.Tensor,
@@ -331,7 +346,8 @@ class PragmaLiteModel(nn.Module):
         calendar_features: torch.Tensor | None = None,
         profile_attention_mask: torch.Tensor | None = None,
         event_attention_mask: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
+        return_mlm_logits: bool = False,
+    ) -> dict[str, torch.Tensor] | torch.Tensor:
         if self.cfg.use_profile_encoder:
             profile_embedding, profile_hidden = self._encode_profile(
                 profile_input_ids,
@@ -357,7 +373,7 @@ class PragmaLiteModel(nn.Module):
             event_times=event_times,
         )
         record_embedding = self.fusion(torch.cat([profile_embedding, history_embedding], dim=-1))
-        return {
+        outputs = {
             "record_embedding": record_embedding,
             "profile_embedding": profile_embedding,
             "event_embeddings": event_embeddings,
@@ -368,6 +384,9 @@ class PragmaLiteModel(nn.Module):
             "profile_hidden": profile_hidden,
             "event_token_hidden": event_token_hidden,
         }
+        if return_mlm_logits:
+            return self._structured_mlm_logits_from_outputs(outputs, event_input_ids)
+        return outputs
 
     def cls_logits(self, hidden_states: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
         if isinstance(hidden_states, dict):

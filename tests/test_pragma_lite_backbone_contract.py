@@ -30,7 +30,10 @@ def _make_batch() -> dict[str, torch.Tensor]:
         "event_input_ids": torch.tensor([[[4, 21, 22, 23], [4, 31, 32, 33]]], dtype=torch.long),
         "event_attention_mask": torch.tensor([[[1, 1, 1, 1], [1, 1, 1, 1]]], dtype=torch.bool),
         "event_times": torch.tensor([[100.0, 10.0]], dtype=torch.float32),
-        "calendar_features": torch.tensor([[[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]]], dtype=torch.float32),
+        "calendar_features": torch.tensor(
+            [[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [6.0, 5.0, 4.0, 3.0, 2.0, 1.0]]],
+            dtype=torch.float32,
+        ),
     }
 
 

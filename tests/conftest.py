@@ -22,6 +22,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     strict_files = {
         "test_pragma_lite_rope_pipeline.py",
         "test_pragma_lite_backbone_contract.py",
+        "test_structured_data_pipeline.py",
     }
     skipped: list[str] = []
     for item in session.items:

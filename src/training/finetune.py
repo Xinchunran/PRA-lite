@@ -11,18 +11,23 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.common.yaml_utils import load_yaml
-from src.model.pragma_lite.model import PragmaLite, PragmaLiteConfig
+from src.model.pragma_lite.model import PragmaLite, PragmaLiteConfig, PragmaLiteModel
 from src.tokenizer.vocab import TokenizerVocab
 from src.training.checkpoint import load_checkpoint, save_checkpoint
 from src.training.data import TokenizedDataset, pad_collate, read_ids, set_seed
 
 
-def _load_model_from_checkpoint(ckpt_path: Path, device: str) -> tuple[PragmaLite, TokenizerVocab, dict]:
+def _load_model_from_checkpoint(
+    ckpt_path: Path,
+    device: str,
+    structured_inputs: bool,
+) -> tuple[nn.Module, TokenizerVocab, dict]:
     ckpt = load_checkpoint(ckpt_path, map_location=device)
     tokenizer_dir = Path(ckpt["tokenizer_dir"])
     vocab = TokenizerVocab.load(tokenizer_dir)
     cfg = PragmaLiteConfig(**ckpt["model_cfg"])
-    model = PragmaLite(cfg)
+    model_cls = PragmaLiteModel if structured_inputs else PragmaLite
+    model = model_cls(cfg)
     model.load_state_dict(ckpt["model_state"])
     model.to(device)
     return model, vocab, ckpt
@@ -47,12 +52,15 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    model, vocab, ckpt = _load_model_from_checkpoint(Path(args.checkpoint), args.device)
-
     train_ids = read_ids(split_dir / "train_ids.txt")
     valid_ids = read_ids(split_dir / "valid_ids.txt")
     train_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=train_ids)
     valid_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=valid_ids)
+    model, vocab, ckpt = _load_model_from_checkpoint(
+        Path(args.checkpoint),
+        args.device,
+        structured_inputs=train_ds.has_structured_inputs,
+    )
 
     batch_size = int(train_cfg["training"].get("batch_size", 32))
     train_loader = DataLoader(
@@ -85,13 +93,14 @@ def main() -> None:
         running = 0.0
         n = 0
         for step, batch in enumerate(tqdm(train_loader, desc=f"finetune epoch {epoch+1}/{max_epochs}")):
-            input_ids = batch.input_ids.to(args.device)
-            attention_mask = batch.attention_mask.to(args.device)
             labels = batch.labels.to(args.device) if batch.labels is not None else None
             if labels is None:
                 raise ValueError("Tokenized dataset must include label for finetune")
 
-            h = model(input_ids, attention_mask=attention_mask)
+            model_inputs = {
+                key: value.to(args.device) for key, value in batch.model_inputs().items() if value is not None
+            }
+            h = model(**model_inputs)
             logits = model.cls_logits(h)
             loss = loss_fn(logits, labels)
 
@@ -99,8 +108,8 @@ def main() -> None:
             loss.backward()
             optimizer.step()
 
-            running += float(loss.item()) * len(input_ids)
-            n += len(input_ids)
+            running += float(loss.item()) * len(labels)
+            n += len(labels)
 
             if (step + 1) % log_every == 0:
                 pass
@@ -112,10 +121,11 @@ def main() -> None:
             all_logits = []
             all_labels = []
             for batch in valid_loader:
-                input_ids = batch.input_ids.to(args.device)
-                attention_mask = batch.attention_mask.to(args.device)
                 labels = batch.labels.to(args.device) if batch.labels is not None else None
-                h = model(input_ids, attention_mask=attention_mask)
+                model_inputs = {
+                    key: value.to(args.device) for key, value in batch.model_inputs().items() if value is not None
+                }
+                h = model(**model_inputs)
                 logits = model.cls_logits(h)
                 all_logits.append(logits.detach().cpu().numpy())
                 all_labels.append(labels.detach().cpu().numpy())
