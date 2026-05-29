@@ -1,0 +1,6 @@
+{
+  "n_total": 200,
+  "n_train": 140,
+  "n_valid": 30,
+  "n_test": 30
+}

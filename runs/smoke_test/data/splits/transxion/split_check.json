@@ -1,0 +1,31 @@
+{
+  "leakage": {
+    "train_valid_overlap": 0,
+    "train_test_overlap": 0,
+    "valid_test_overlap": 0
+  },
+  "counts": {
+    "train": 140,
+    "valid": 30,
+    "test": 30,
+    "total_unique": 200
+  },
+  "missing_entity_ids_count": 0,
+  "label_stats": {
+    "train": {
+      "n": 140,
+      "pos": 71,
+      "pos_rate": 0.5071428571428571
+    },
+    "valid": {
+      "n": 30,
+      "pos": 11,
+      "pos_rate": 0.36666666666666664
+    },
+    "test": {
+      "n": 30,
+      "pos": 16,
+      "pos_rate": 0.5333333333333333
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "dataset": "transxion",
+  "processed_dir": "runs/smoke_test/data/processed/transxion",
+  "profile_columns": [
+    "entity_type",
+    "age_bucket",
+    "region",
+    "account_region",
+    "created_at"
+  ],
+  "event_columns": [
+    "timestamp",
+    "event_type",
+    "receiver_id",
+    "amount",
+    "currency",
+    "payment_format",
+    "sender_bank",
+    "receiver_bank",
+    "is_laundering",
+    "receiver_type"
+  ],
+  "label_column": "label",
+  "evaluation_time_column": "evaluation_time",
+  "entity_id_dtype": "int64",
+  "merchant_table_present": true
+}

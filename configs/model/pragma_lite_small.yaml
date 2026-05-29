@@ -1,0 +1,7 @@
+model:
+  name: pragma_lite_small
+  d_model: 192
+  n_heads: 3
+  n_layers: 4
+  dropout: 0.1
+  max_seq_len: 4096

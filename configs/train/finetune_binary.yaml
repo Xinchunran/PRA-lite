@@ -1,0 +1,8 @@
+training:
+  task: binary_classification
+  batch_size: 32
+  max_epochs: 3
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  seed: 42
+  log_every: 50

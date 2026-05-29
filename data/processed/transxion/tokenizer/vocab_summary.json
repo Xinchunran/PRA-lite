@@ -1,0 +1,23 @@
+{
+  "vocab_size": 572,
+  "profile_cols": [
+    "entity_type",
+    "age_bucket",
+    "region",
+    "account_region",
+    "created_at"
+  ],
+  "event_cols": [
+    "event_type",
+    "receiver_id",
+    "amount",
+    "currency",
+    "payment_format",
+    "sender_bank",
+    "receiver_bank",
+    "is_laundering",
+    "receiver_type"
+  ],
+  "num_buckets": 100,
+  "min_freq": 5
+}

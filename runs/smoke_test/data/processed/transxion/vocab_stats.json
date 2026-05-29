@@ -1,0 +1,62 @@
+{
+  "profile": {
+    "entity_type": {
+      "type": "categorical",
+      "unique": 1
+    },
+    "age_bucket": {
+      "type": "categorical",
+      "unique": 6
+    },
+    "region": {
+      "type": "categorical",
+      "unique": 5
+    },
+    "account_region": {
+      "type": "categorical",
+      "unique": 5
+    },
+    "created_at": {
+      "type": "categorical",
+      "unique": 125
+    }
+  },
+  "event": {
+    "event_type": {
+      "type": "categorical",
+      "unique": 1
+    },
+    "receiver_id": {
+      "type": "numeric",
+      "count": 8000
+    },
+    "amount": {
+      "type": "numeric",
+      "count": 8000
+    },
+    "currency": {
+      "type": "categorical",
+      "unique": 5
+    },
+    "payment_format": {
+      "type": "categorical",
+      "unique": 4
+    },
+    "sender_bank": {
+      "type": "categorical",
+      "unique": 4
+    },
+    "receiver_bank": {
+      "type": "categorical",
+      "unique": 4
+    },
+    "is_laundering": {
+      "type": "numeric",
+      "count": 8000
+    },
+    "receiver_type": {
+      "type": "categorical",
+      "unique": 2
+    }
+  }
+}
