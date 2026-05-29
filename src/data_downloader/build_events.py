@@ -10,6 +10,14 @@ from src.common.fs import ensure_dir, write_json
 from src.common.yaml_utils import load_yaml
 
 
+def _drop_forbidden_label_columns(events: pd.DataFrame, label_col: str) -> pd.DataFrame:
+    forbidden = {label_col, "label", "target", "is_fraud", "is_laundering"}
+    to_drop = [col for col in forbidden if col in events.columns]
+    if not to_drop:
+        return events
+    return events.drop(columns=to_drop)
+
+
 def _safe_read_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing file: {path}")
@@ -76,6 +84,9 @@ def build_transxion_events(config_path: Path) -> None:
     events = events.rename(columns={"sender_id": "entity_id"})
     events["event_id"] = events["transaction_id"].astype("int64")
     events = events.drop(columns=["transaction_id"])
+    labels = events.groupby("entity_id", as_index=False)[cfg["label_col"]].max()
+    labels = labels.rename(columns={cfg["label_col"]: "label"})
+    events = _drop_forbidden_label_columns(events, cfg["label_col"])
 
     if "receiver_id" in events.columns:
         events["receiver_type"] = (events["receiver_id"].astype("int64") >= 10_000_000).map(
@@ -94,9 +105,6 @@ def build_transxion_events(config_path: Path) -> None:
     if "receiver_type" not in event_cols:
         event_cols.append("receiver_type")
     events = events[event_cols].sort_values(["entity_id", "timestamp", "event_id"]).reset_index(drop=True)
-
-    labels = events.groupby("entity_id", as_index=False)[cfg["label_col"]].max()
-    labels = labels.rename(columns={cfg["label_col"]: "label"})
 
     evaluation_time = events.groupby("entity_id", as_index=False)["timestamp"].max().rename(
         columns={"timestamp": "evaluation_time"}

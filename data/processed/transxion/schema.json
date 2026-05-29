@@ -17,7 +17,6 @@
     "payment_format",
     "sender_bank",
     "receiver_bank",
-    "is_laundering",
     "receiver_type"
   ],
   "label_column": "label",

@@ -1,5 +1,5 @@
 {
-  "vocab_size": 572,
+  "vocab_size": 437,
   "profile_cols": [
     "entity_type",
     "age_bucket",
@@ -15,7 +15,6 @@
     "payment_format",
     "sender_bank",
     "receiver_bank",
-    "is_laundering",
     "receiver_type"
   ],
   "num_buckets": 100,

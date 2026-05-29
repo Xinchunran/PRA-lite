@@ -24,6 +24,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         "test_pragma_lite_backbone_contract.py",
         "test_structured_data_pipeline.py",
         "test_no_flat_legacy_paths.py",
+        "test_label_leakage_guards.py",
+        "test_linear_probe_benchmark.py",
     }
     skipped: list[str] = []
     for item in session.items:

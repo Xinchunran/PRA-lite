@@ -50,10 +50,6 @@
       "type": "categorical",
       "unique": 4
     },
-    "is_laundering": {
-      "type": "numeric",
-      "count": 200000
-    },
     "receiver_type": {
       "type": "categorical",
       "unique": 2

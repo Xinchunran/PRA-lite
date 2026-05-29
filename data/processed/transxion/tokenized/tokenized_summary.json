@@ -1,5 +1,7 @@
 {
   "num_records": 5000,
-  "vocab_size": 572,
-  "max_len": 1418
+  "vocab_size": 437,
+  "max_profile_tokens": 200,
+  "max_event_tokens": 24,
+  "max_events": 512
 }

@@ -22,4 +22,3 @@ transaction_columns:
   - payment_format
   - sender_bank
   - receiver_bank
-  - is_laundering
