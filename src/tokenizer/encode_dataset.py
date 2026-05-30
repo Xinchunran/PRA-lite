@@ -11,6 +11,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from src.common.fs import ensure_dir, write_json
+from src.common.tokenized_lmdb import TokenizedLmdbWriter
 from src.tokenizer.structured import StructuredRecordConfig, encode_record
 from src.tokenizer.vocab import TokenizerVocab
 
@@ -78,17 +79,96 @@ def _resolve_mp_context(num_workers: int) -> multiprocessing.context.BaseContext
         return multiprocessing.get_context("forkserver")
     return multiprocessing.get_context(available[0])
 
+
+def _read_ids(path: Path) -> set[int]:
+    return {int(line.strip()) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+
+def _write_parquet(df: pd.DataFrame, path: Path, row_group_size: int) -> None:
+    df.to_parquet(path, index=False, row_group_size=row_group_size)
+
+
+def _write_split_parquets(df: pd.DataFrame, split_dir: Path, out_dir: Path, row_group_size: int) -> None:
+    for split_name in ("train", "valid", "test"):
+        ids_path = split_dir / f"{split_name}_ids.txt"
+        if not ids_path.exists():
+            continue
+        split_ids = _read_ids(ids_path)
+        split_df = df[df["entity_id"].isin(split_ids)].copy()
+        _write_parquet(split_df, out_dir / f"{split_name}.parquet", row_group_size=row_group_size)
+
+
+def _load_split_ids(split_dir: Path | None) -> dict[str, set[int]]:
+    if split_dir is None:
+        return {}
+    split_ids: dict[str, set[int]] = {}
+    for split_name in ("train", "valid", "test"):
+        ids_path = split_dir / f"{split_name}_ids.txt"
+        if ids_path.exists():
+            split_ids[split_name] = _read_ids(ids_path)
+    return split_ids
+
+
+def _build_lmdb_writers(
+    out_dir: Path,
+    backend: str,
+    split_ids: dict[str, set[int]],
+    map_size_gb: int,
+    commit_interval: int,
+) -> tuple[TokenizedLmdbWriter | None, dict[str, TokenizedLmdbWriter]]:
+    dataset_writer = None
+    if backend in {"lmdb", "both"}:
+        dataset_writer = TokenizedLmdbWriter(out_dir / "dataset.lmdb", map_size_gb=map_size_gb, commit_interval=commit_interval)
+    split_writers: dict[str, TokenizedLmdbWriter] = {}
+    if backend in {"lmdb", "both"} and split_ids:
+        for split_name in split_ids:
+            split_writers[split_name] = TokenizedLmdbWriter(
+                out_dir / f"{split_name}.lmdb",
+                map_size_gb=map_size_gb,
+                commit_interval=commit_interval,
+            )
+    return dataset_writer, split_writers
+
+
+def _route_row_to_lmdb(
+    row: dict[str, Any],
+    dataset_writer: TokenizedLmdbWriter | None,
+    split_writers: dict[str, TokenizedLmdbWriter],
+    split_ids: dict[str, set[int]],
+) -> None:
+    if dataset_writer is not None:
+        dataset_writer.write(row)
+    entity_id = int(row["entity_id"])
+    for split_name, ids in split_ids.items():
+        if entity_id in ids and split_name in split_writers:
+            split_writers[split_name].write(row)
+            break
+
+
+def _close_lmdb_writers(dataset_writer: TokenizedLmdbWriter | None, split_writers: dict[str, TokenizedLmdbWriter]) -> None:
+    if dataset_writer is not None:
+        dataset_writer.close()
+    for writer in split_writers.values():
+        writer.close()
+
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--processed_dir", required=True)
     parser.add_argument("--tokenizer_dir", required=True)
+    parser.add_argument("--split_dir")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--max_events", type=int, default=512)
     parser.add_argument("--max_event_tokens", type=int, default=24)
     parser.add_argument("--max_profile_tokens", type=int, default=200)
+    parser.add_argument("--backend", choices=["parquet", "lmdb", "both"], default="parquet")
+    parser.add_argument("--row_group_size", type=int, default=4096)
     parser.add_argument("--num_workers", type=int, default=1)
-    args = parser.parse_args()
+    parser.add_argument("--lmdb_map_size_gb", type=int, default=64)
+    parser.add_argument("--lmdb_commit_interval", type=int, default=1024)
 
+    args = parser.parse_args()
     processed_dir = Path(args.processed_dir)
     vocab = TokenizerVocab.load(args.tokenizer_dir)
     out_dir = Path(args.output_dir)
@@ -110,38 +190,59 @@ def main() -> None:
         max_profile_tokens=args.max_profile_tokens,
     )
     payloads = _make_payloads(profiles=profiles, events=events, labels=labels, max_events=args.max_events)
+    split_dir = Path(args.split_dir) if args.split_dir else None
+    split_ids = _load_split_ids(split_dir)
+    dataset_writer, split_writers = _build_lmdb_writers(
+        out_dir=out_dir,
+        backend=args.backend,
+        split_ids=split_ids,
+        map_size_gb=args.lmdb_map_size_gb,
+        commit_interval=args.lmdb_commit_interval,
+    )
 
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] | None = [] if args.backend in {"parquet", "both"} else None
     num_workers = max(int(args.num_workers), 1)
-    if num_workers == 1 or len(payloads) <= 1:
-        _init_worker(vocab, cfg)
-        for payload in tqdm(payloads, desc="encode", total=len(payloads)):
-            rows.append(_encode_entity_payload(payload))
-    else:
-        mp_context = _resolve_mp_context(num_workers)
-        with ProcessPoolExecutor(
-            max_workers=num_workers,
-            mp_context=mp_context,
-            initializer=_init_worker,
-            initargs=(vocab, cfg),
-        ) as executor:
-            for row in tqdm(
-                executor.map(_encode_entity_payload, payloads, chunksize=32),
-                desc="encode",
-                total=len(payloads),
-            ):
-                rows.append(row)
+    try:
+        if num_workers == 1 or len(payloads) <= 1:
+            _init_worker(vocab, cfg)
+            iterator = (_encode_entity_payload(payload) for payload in payloads)
+            for row in tqdm(iterator, desc="encode", total=len(payloads)):
+                if rows is not None:
+                    rows.append(row)
+                _route_row_to_lmdb(row, dataset_writer, split_writers, split_ids)
+        else:
+            mp_context = _resolve_mp_context(num_workers)
+            with ProcessPoolExecutor(
+                max_workers=num_workers,
+                mp_context=mp_context,
+                initializer=_init_worker,
+                initargs=(vocab, cfg),
+            ) as executor:
+                iterator = executor.map(_encode_entity_payload, payloads, chunksize=32)
+                for row in tqdm(iterator, desc="encode", total=len(payloads)):
+                    if rows is not None:
+                        rows.append(row)
+                    _route_row_to_lmdb(row, dataset_writer, split_writers, split_ids)
+    finally:
+        _close_lmdb_writers(dataset_writer, split_writers)
 
-    df = pd.DataFrame(rows)
-    df.to_parquet(out_dir / "dataset.parquet", index=False)
+    row_group_size = max(int(args.row_group_size), 1)
+    if rows is not None:
+        df = pd.DataFrame(rows)
+        _write_parquet(df, out_dir / "dataset.parquet", row_group_size=row_group_size)
+        if split_dir:
+            _write_split_parquets(df, split_dir, out_dir, row_group_size=row_group_size)
+    num_records = len(rows) if rows is not None else len(payloads)
     write_json(
         out_dir / "tokenized_summary.json",
         {
-            "num_records": int(len(df)),
+            "num_records": int(num_records),
             "vocab_size": int(len(vocab.token_to_id)),
             "max_profile_tokens": int(args.max_profile_tokens),
             "max_event_tokens": int(args.max_event_tokens),
             "max_events": int(args.max_events),
+            "row_group_size": row_group_size,
+            "backend": args.backend,
         },
     )
 

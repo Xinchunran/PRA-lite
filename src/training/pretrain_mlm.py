@@ -19,7 +19,7 @@ from src.model.pragma_lite.model import PragmaLiteConfig, PragmaLiteModel
 from src.tokenizer.masking import MaskedEventCollator
 from src.tokenizer.vocab import TokenizerVocab
 from src.training.checkpoint import save_checkpoint
-from src.training.data import TokenizedDataset, read_ids, set_seed
+from src.training.data import load_tokenized_split, set_seed
 
 
 def _guess_tokenizer_dir(data_dir: Path) -> Path:
@@ -159,10 +159,8 @@ def main() -> None:
         event_layers=int(model_cfg.get("event_layers", int(model_cfg.get("n_layers", 4)))),
         history_layers=int(model_cfg.get("history_layers", int(model_cfg.get("n_layers", 4)))),
     )
-    train_ids = read_ids(split_dir / "train_ids.txt")
-    valid_ids = read_ids(split_dir / "valid_ids.txt")
-    train_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=train_ids)
-    valid_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=valid_ids)
+    train_ds = load_tokenized_split(data_dir, "train", split_dir=split_dir)
+    valid_ds = load_tokenized_split(data_dir, "valid", split_dir=split_dir)
     model: nn.Module = PragmaLiteModel(cfg).to(device)
     if _is_distributed():
         model = DDP(

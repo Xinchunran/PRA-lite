@@ -17,7 +17,7 @@ from tqdm import tqdm
 from src.model.pragma_lite.model import PragmaLiteConfig, PragmaLiteModel
 from src.tokenizer.vocab import TokenizerVocab
 from src.training.checkpoint import load_checkpoint
-from src.training.data import TokenizedDataset, pad_collate, read_ids, set_seed
+from src.training.data import load_tokenized_split, pad_collate, set_seed
 
 
 def _build_loader(ds: TokenizedDataset, pad_id: int, batch_size: int) -> DataLoader:
@@ -116,8 +116,7 @@ def run_probe_experiment(
     model.load_state_dict(ckpt["model_state"])
     model.to(device)
 
-    train_ids = read_ids(split_dir / f"{train_split_name}_ids.txt")
-    train_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=train_ids)
+    train_ds = load_tokenized_split(data_dir, train_split_name, split_dir=split_dir)
     train_loader = _build_loader(train_ds, pad_id=vocab.pad_id, batch_size=batch_size)
     x_train, y_train, train_entity_ids = collect_representations(model, train_loader, device=device, repr_type=repr_type)
 
@@ -150,8 +149,7 @@ def run_probe_experiment(
     train_pred_df.to_parquet(output_dir / f"{repr_type}_train_predictions.parquet", index=False)
 
     for split_name in eval_splits:
-        split_ids = read_ids(split_dir / f"{split_name}_ids.txt")
-        split_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=split_ids)
+        split_ds = load_tokenized_split(data_dir, split_name, split_dir=split_dir)
         split_loader = _build_loader(split_ds, pad_id=vocab.pad_id, batch_size=batch_size)
         x_eval, y_eval, eval_entity_ids = collect_representations(model, split_loader, device=device, repr_type=repr_type)
         y_score = clf.predict_proba(scaler.transform(x_eval))[:, 1]

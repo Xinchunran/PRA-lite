@@ -14,7 +14,7 @@ from src.common.yaml_utils import load_yaml
 from src.model.pragma_lite.model import PragmaLiteConfig, PragmaLiteModel
 from src.tokenizer.vocab import TokenizerVocab
 from src.training.checkpoint import load_checkpoint, save_checkpoint
-from src.training.data import TokenizedDataset, pad_collate, read_ids, set_seed
+from src.training.data import load_tokenized_split, pad_collate, set_seed
 
 
 def _load_model_from_checkpoint(
@@ -50,10 +50,8 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_ids = read_ids(split_dir / "train_ids.txt")
-    valid_ids = read_ids(split_dir / "valid_ids.txt")
-    train_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=train_ids)
-    valid_ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=valid_ids)
+    train_ds = load_tokenized_split(data_dir, "train", split_dir=split_dir)
+    valid_ds = load_tokenized_split(data_dir, "valid", split_dir=split_dir)
     model, vocab, ckpt = _load_model_from_checkpoint(
         Path(args.checkpoint),
         args.device,

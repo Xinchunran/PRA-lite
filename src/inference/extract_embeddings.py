@@ -11,7 +11,7 @@ from tqdm import tqdm
 from src.model.pragma_lite.model import PragmaLiteConfig, PragmaLiteModel
 from src.tokenizer.vocab import TokenizerVocab
 from src.training.checkpoint import load_checkpoint
-from src.training.data import TokenizedDataset, pad_collate, read_ids
+from src.training.data import load_tokenized_dataset, load_tokenized_split, pad_collate
 
 
 def _guess_split_dir(data_dir: Path) -> Path | None:
@@ -40,14 +40,13 @@ def main() -> None:
     vocab = TokenizerVocab.load(tokenizer_dir)
 
     data_dir = Path(args.data_dir)
-    ids = None
     if args.split != "all":
         split_dir = Path(args.split_dir) if args.split_dir else _guess_split_dir(data_dir)
         if split_dir is None:
             raise ValueError("Unable to infer split_dir; pass --split_dir explicitly")
-        ids = read_ids(split_dir / f"{args.split}_ids.txt")
-
-    ds = TokenizedDataset(data_dir / "dataset.parquet", entity_ids=ids)
+        ds = load_tokenized_split(data_dir, args.split, split_dir=split_dir)
+    else:
+        ds = load_tokenized_dataset(data_dir)
     cfg = PragmaLiteConfig(**ckpt["model_cfg"])
     model = PragmaLiteModel(cfg)
     model.load_state_dict(ckpt["model_state"])
