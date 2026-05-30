@@ -117,6 +117,67 @@ def test_encode_dataset_writes_structured_columns(tmp_path: Path, monkeypatch) -
     assert len(df.loc[0, "calendar_features"][0]) == 6
 
 
+def test_encode_dataset_parallel_matches_single_worker(tmp_path: Path, monkeypatch) -> None:
+    processed_dir = tmp_path / "processed"
+    tokenizer_dir = tmp_path / "tokenizer"
+    output_dir_single = tmp_path / "tokenized_single"
+    output_dir_parallel = tmp_path / "tokenized_parallel"
+    processed_dir.mkdir()
+    tokenizer_dir.mkdir()
+    _write_processed_tables(processed_dir)
+    _write_tokenizer(tokenizer_dir)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "encode_dataset",
+            "--processed_dir",
+            str(processed_dir),
+            "--tokenizer_dir",
+            str(tokenizer_dir),
+            "--output_dir",
+            str(output_dir_single),
+            "--max_events",
+            "3",
+            "--max_event_tokens",
+            "4",
+            "--max_profile_tokens",
+            "4",
+            "--num_workers",
+            "1",
+        ],
+    )
+    encode_dataset_main()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "encode_dataset",
+            "--processed_dir",
+            str(processed_dir),
+            "--tokenizer_dir",
+            str(tokenizer_dir),
+            "--output_dir",
+            str(output_dir_parallel),
+            "--max_events",
+            "3",
+            "--max_event_tokens",
+            "4",
+            "--max_profile_tokens",
+            "4",
+            "--num_workers",
+            "2",
+        ],
+    )
+    encode_dataset_main()
+
+    df_single = pd.read_parquet(output_dir_single / "dataset.parquet").sort_values("entity_id").reset_index(drop=True)
+    df_parallel = pd.read_parquet(output_dir_parallel / "dataset.parquet").sort_values("entity_id").reset_index(drop=True)
+    pd.testing.assert_frame_equal(df_single, df_parallel)
+
+
 def test_dataloader_returns_structured_batch_and_direct_model_inputs(tmp_path: Path, monkeypatch) -> None:
     processed_dir = tmp_path / "processed"
     tokenizer_dir = tmp_path / "tokenizer"

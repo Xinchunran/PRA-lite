@@ -31,6 +31,10 @@ def relative_time_feature(event_ts: pd.Timestamp, evaluation_ts: pd.Timestamp) -
 
 
 def _maybe_parse_ts(value: Any) -> pd.Timestamp | None:
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
+        return value.tz_localize("UTC") if value.tzinfo is None else value
     ts = pd.to_datetime(value, utc=True, errors="coerce")
     if pd.isna(ts):
         return None
@@ -118,7 +122,7 @@ def encode_event_features(
     max_event_tokens: int,
 ) -> dict[str, list]:
     if isinstance(events, pd.DataFrame):
-        event_rows = [row for _, row in events.iterrows()]
+        event_rows = events.to_dict("records")
     else:
         event_rows = list(events)
 
@@ -134,9 +138,12 @@ def encode_event_features(
         if isinstance(row, pd.Series):
             fields = row
             timestamp = row["timestamp"]
-        else:
+        elif isinstance(row, dict) and "fields" in row:
             fields = row.get("fields", {}) or {}
             timestamp = row.get("timestamp")
+        else:
+            fields = row
+            timestamp = row.get("timestamp") if isinstance(row, dict) else None
         ts = _maybe_parse_ts(timestamp)
         if ts is None:
             continue
