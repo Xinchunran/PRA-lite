@@ -51,15 +51,17 @@ def test_evaluate_reduces_validation_loss_across_ranks(monkeypatch) -> None:
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
     valid_loader = [_make_batch(), _make_batch()]
 
-    valid_loss = pretrain_mlm._evaluate(
+    valid_metrics = pretrain_mlm._evaluate(
         model=model,
         valid_loader=valid_loader,  # type: ignore[arg-type]
         loss_fn=loss_fn,
         device=torch.device("cpu"),
+        precision="fp32",
     )
 
     assert called["all_reduce"] == 1
-    assert valid_loss > 0.0
+    assert float(valid_metrics["valid_loss"]) > 0.0
+    assert float(valid_metrics["valid_masked_accuracy"]) >= 0.0
 
 
 def test_evaluate_skips_all_reduce_outside_distributed(monkeypatch) -> None:
@@ -74,11 +76,13 @@ def test_evaluate_skips_all_reduce_outside_distributed(monkeypatch) -> None:
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
     valid_loader = [_make_batch()]
 
-    valid_loss = pretrain_mlm._evaluate(
+    valid_metrics = pretrain_mlm._evaluate(
         model=model,
         valid_loader=valid_loader,  # type: ignore[arg-type]
         loss_fn=loss_fn,
         device=torch.device("cpu"),
+        precision="fp32",
     )
 
-    assert valid_loss > 0.0
+    assert float(valid_metrics["valid_loss"]) > 0.0
+    assert float(valid_metrics["valid_masked_accuracy"]) >= 0.0

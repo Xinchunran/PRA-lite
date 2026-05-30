@@ -8,6 +8,24 @@ from typing import Any
 import matplotlib.pyplot as plt
 
 
+DEFAULT_PLOT_FILES = (
+    "train_loss.png",
+    "train_masked_accuracy.png",
+    "valid_loss.png",
+    "valid_masked_accuracy.png",
+    "valid_perplexity.png",
+    "grad_norm.png",
+    "ready_shards.png",
+    "learning_rate.png",
+    "throughput.png",
+    "timings.png",
+    "gpu_memory.png",
+    "loss_overview.png",
+    "validation_metrics.png",
+    "validation_activity.png",
+)
+
+
 def load_metrics(metrics_path: Path) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for line in metrics_path.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -43,6 +61,34 @@ def _single_plot(entries: list[dict[str, Any]], kind: str, metric: str, output_p
     plt.ylabel(ylabel)
     plt.title(title)
     plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+
+
+def _multi_kind_plot(
+    entries: list[dict[str, Any]],
+    metrics: list[tuple[str, str, str, str]],
+    output_path: Path,
+    title: str,
+    ylabel: str,
+) -> None:
+    plotted = False
+    plt.figure(figsize=(10, 5))
+    for kind, metric, label, color in metrics:
+        xs, ys = _series(entries, kind, metric)
+        if not xs:
+            continue
+        plotted = True
+        plt.plot(xs, ys, linewidth=1.2, label=label, color=color)
+    if not plotted:
+        plt.close()
+        return
+    plt.xlabel("Step")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.grid(True, alpha=0.25)
+    plt.legend()
     plt.tight_layout()
     plt.savefig(output_path, dpi=160)
     plt.close()
@@ -161,6 +207,37 @@ def generate_plots(entries: list[dict[str, Any]], output_dir: Path, title_prefix
         output_dir / "gpu_memory.png",
         f"{title_prefix} GPU Memory",
         "GB",
+    )
+    _multi_kind_plot(
+        entries,
+        [
+            ("train", "train_loss", "train_loss", "#2563eb"),
+            ("valid", "valid_loss", "valid_loss", "#dc2626"),
+            ("valid", "best_valid_loss", "best_valid_loss", "#16a34a"),
+        ],
+        output_dir / "loss_overview.png",
+        f"{title_prefix} Loss Overview",
+        "Loss",
+    )
+    _multi_kind_plot(
+        entries,
+        [
+            ("valid", "valid_masked_accuracy", "valid_masked_accuracy", "#2563eb"),
+            ("valid", "valid_perplexity", "valid_perplexity", "#dc2626"),
+        ],
+        output_dir / "validation_metrics.png",
+        f"{title_prefix} Validation Metrics",
+        "Metric",
+    )
+    _multi_kind_plot(
+        entries,
+        [
+            ("valid", "valid_batches", "valid_batches", "#2563eb"),
+            ("valid", "num_ready_shards", "ready_shards", "#16a34a"),
+        ],
+        output_dir / "validation_activity.png",
+        f"{title_prefix} Validation Activity",
+        "Count",
     )
 
 

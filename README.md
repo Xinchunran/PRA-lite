@@ -2,6 +2,25 @@
 
 PRAGMA Lite is a lightweight PRAGMA-inspired transformer for transactional event sequences. It supports structured tokenization, masked pretraining, checkpoint-based inference, and frozen-probe evaluation on public AML-style datasets such as TransXion and IBM AML.
 
+## PRAGMA vs PRA-lite Implementation Status
+
+This table compares the original [PRAGMA paper (arXiv:2604.08649)](https://arxiv.org/abs/2604.08649) features with the current PRA-lite implementation.
+
+| Category | Feature | PRAGMA | PRA-lite |
+| :--- | :--- | :---: | :---: |
+| **Architecture** | Profile Encoder (Bidirectional Transformer) | ☑️ | ☑️ |
+| | Event Encoder (Bidirectional Transformer) | ☑️ | ☑️ |
+| | History Encoder (Bidirectional Transformer) | ☑️ | ☑️ |
+| | Event-local attention kernel that prevents cross-event token attention | ☑️ | ✖️ |
+| | RoPE time/position encoding in profile and history encoders | ☑️ | ☑️ |
+| | Key-value-time representation with fused history context | ☑️ | ☑️ |
+| **Data Processing** | Key-Value-Time Tokenisation | ☑️ | ☑️ |
+| | Numeric Percentile Bucketing | ☑️ | ☑️ |
+| | Log-seconds Relative Time Feature | ☑️ | ☑️ |
+| | Calendar Time Features | ☑️ | ☑️ |
+| | LMDB-backed storage / shard-based streaming pipeline | ☑️ | ☑️ |
+| | Low-frequency Vocab Pruning | ✖️ | ☑️ |
+
 ## Main Entry Points
 
 - `src/model/pragma_lite/model.py`: model definition
@@ -137,6 +156,40 @@ NPROC_PER_NODE=4 \
 PRECISION=bf16 \
 TOKENIZE_NUM_WORKERS=8 \
 bash scripts/run_ibm_aml_medium_streaming.sh
+```
+
+### Split Protocols
+
+IBM AML experiments now keep two split protocols in parallel:
+
+| Split Protocol | Default Data Root | Record Policy | Split Rule | Recommended Use |
+| :--- | :--- | :--- | :--- | :--- |
+| Random / Hash Split | `data/streaming/ibm_aml_li_medium` | One account-level evaluation point per encoded sample in the legacy streaming pipeline | Hash-by-entity with `train/valid/test` fractions | Fast iteration, backward-compatible baselines, quick MLM debugging |
+| Stage C PRAGMA-Style Split | `data/streaming/ibm_aml_li_medium_pragma_c` | Multi-evaluation-point account-centric records tied to real transaction timestamps | Global `evaluation_time` split with `train / embargo / valid / calibration / embargo / test` | Financial-style temporal validation, leakage control, isolated Stage C checkpoints |
+
+The legacy random/hash split entry point remains:
+
+```bash
+bash scripts/run_ibm_aml_medium_streaming.sh
+```
+
+Stage C uses a separate data root, tokenizer, manifest, logs, plots, and checkpoints:
+
+```bash
+bash scripts/prepare_ibm_aml_li_pragma_c.sh
+bash scripts/run_ibm_aml_li_medium_pragma_c_pretrain.sh
+```
+
+The Stage C train entry point defaults to `MAX_EVENTS=512` and `split_mode=pragma_c`. You can still fall back to the legacy split logic without changing training code:
+
+```bash
+SPLIT_MODE=random bash scripts/run_ibm_aml_li_medium_pragma_c_pretrain.sh
+```
+
+When Stage C is launched through `scripts/run_ibm_aml_li_medium_pragma_c_pretrain.sh`, logs and checkpoints are written to an isolated run root:
+
+```text
+runs/pretrain_ibm_aml_li_medium_pragma_c/
 ```
 
 ## Notes

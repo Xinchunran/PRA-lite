@@ -15,6 +15,11 @@ training:
   num_workers: 8
   pin_memory: true
 
+data:
+  split_mode: pragma_c
+  train_split: train
+  valid_split: valid
+
 dataloader:
   num_workers: 8
   pin_memory: true

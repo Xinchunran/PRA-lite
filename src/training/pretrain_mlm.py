@@ -231,6 +231,8 @@ def _build_data_loaders(
     data_dir: Path,
     split_dir: Path,
     manifest_path: Path | None,
+    train_split_name: str,
+    valid_split_name: str,
     batch_size: int,
     seed: int,
     dataloader_cfg: dict[str, object],
@@ -238,11 +240,11 @@ def _build_data_loaders(
     valid_collator: MaskedEventCollator,
 ) -> tuple[object, object, DataLoader, DataLoader, DistributedSampler | None, DistributedSampler | None]:
     if manifest_path is not None:
-        train_ds = load_tokenized_manifest_split(manifest_path, "train")
-        valid_ds = load_tokenized_manifest_split(manifest_path, "valid")
+        train_ds = load_tokenized_manifest_split(manifest_path, train_split_name)
+        valid_ds = load_tokenized_manifest_split(manifest_path, valid_split_name)
     else:
-        train_ds = load_tokenized_split(data_dir, "train", split_dir=split_dir)
-        valid_ds = load_tokenized_split(data_dir, "valid", split_dir=split_dir)
+        train_ds = load_tokenized_split(data_dir, train_split_name, split_dir=split_dir)
+        valid_ds = load_tokenized_split(data_dir, valid_split_name, split_dir=split_dir)
 
     num_workers = int(dataloader_cfg["num_workers"])
     pin_memory = bool(dataloader_cfg["pin_memory"])
@@ -306,6 +308,21 @@ def _append_metrics(metrics_path: Path, payload: dict[str, object]) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def _maybe_generate_plots(metrics_path: Path, output_dir: Path, title_prefix: str) -> None:
+    try:
+        from tools.plot_pretrain_metrics import generate_plots, load_metrics
+    except Exception:
+        return
+    if not metrics_path.exists():
+        return
+    try:
+        entries = load_metrics(metrics_path)
+        if entries:
+            generate_plots(entries, output_dir, title_prefix)
+    except Exception:
+        return
+
+
 def _masked_accuracy_stats(logits: torch.Tensor, labels: torch.Tensor) -> tuple[int, int]:
     with torch.no_grad():
         valid = labels.ne(-100)
@@ -357,6 +374,7 @@ def _evaluate(
     loss_fn: nn.Module,
     device: torch.device,
     precision: str,
+    max_batches: int | None = None,
 ) -> dict[str, float]:
     total_loss = 0.0
     total_batches = 0
@@ -364,6 +382,8 @@ def _evaluate(
     total_masked_count = 0.0
     with torch.no_grad():
         for batch in valid_loader:
+            if max_batches is not None and total_batches >= max_batches:
+                break
             model_inputs = {
                 key: value.to(device, non_blocking=True)
                 for key, value in batch.items()
@@ -410,6 +430,7 @@ def _evaluate(
         "valid_loss": valid_loss,
         "valid_masked_accuracy": valid_masked_accuracy,
         "valid_perplexity": valid_perplexity,
+        "valid_batches": float(total_batches),
     }
 
 
@@ -480,6 +501,12 @@ def main() -> None:
         )
 
     batch_size = _env_int("TRAIN_BATCH_SIZE", int(train_cfg["training"].get("batch_size", 32)))
+    data_cfg = train_cfg.get("data", {})
+    if not isinstance(data_cfg, dict):
+        data_cfg = {}
+    split_mode = str(os.environ.get("DATA_SPLIT_MODE", data_cfg.get("split_mode", "random"))).strip().lower()
+    train_split_name = str(os.environ.get("TRAIN_SPLIT_NAME", data_cfg.get("train_split", "train"))).strip()
+    valid_split_name = str(os.environ.get("VALID_SPLIT_NAME", data_cfg.get("valid_split", "valid"))).strip()
     dataloader_cfg = _resolve_dataloader_cfg(train_cfg)
     lr = float(train_cfg["training"].get("learning_rate", 3e-4))
     wd = float(train_cfg["training"].get("weight_decay", 0.01))
@@ -488,7 +515,14 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
     log_every = _env_int("LOG_EVERY", int(train_cfg["training"].get("log_every", 50)))
+    valid_every = _env_int("VALID_EVERY", int(train_cfg["training"].get("valid_every", log_every)))
+    full_valid_every = _env_int("FULL_VALID_EVERY", int(train_cfg["training"].get("full_valid_every", 0)))
+    max_valid_batches_raw = _env_int("MAX_VALID_BATCHES", int(train_cfg["training"].get("max_valid_batches", 0)))
+    max_valid_batches = max_valid_batches_raw if max_valid_batches_raw > 0 else None
     checkpoint_every = _env_int("CHECKPOINT_EVERY", log_every)
+    plot_every = _env_int("PLOT_EVERY", int(train_cfg["training"].get("plot_every", 5000)))
+    plots_dir = Path(os.environ.get("PLOTS_DIR", str(out_dir / "plots")))
+    plot_title_prefix = str(os.environ.get("PLOT_TITLE_PREFIX", "Pretrain"))
     masking_cfg = train_cfg.get("masking", {})
     train_collator = MaskedEventCollator(
         mask_token_id=vocab.mask_id,
@@ -521,6 +555,8 @@ def main() -> None:
         data_dir=data_dir,
         split_dir=split_dir,
         manifest_path=manifest_path,
+        train_split_name=train_split_name,
+        valid_split_name=valid_split_name,
         batch_size=batch_size,
         seed=seed,
         dataloader_cfg=dataloader_cfg,
@@ -540,6 +576,9 @@ def main() -> None:
         msg="[DEBUG] datasets loaded",
         data_dir=str(data_dir),
         manifest_path=str(manifest_path) if manifest_path is not None else None,
+        split_mode=split_mode,
+        train_split_name=train_split_name,
+        valid_split_name=valid_split_name,
         train_len=len(train_ds),
         valid_len=len(valid_ds),
         train_backend=type(train_ds).__name__,
@@ -616,6 +655,8 @@ def main() -> None:
                     data_dir=data_dir,
                     split_dir=split_dir,
                     manifest_path=manifest_path,
+                    train_split_name=train_split_name,
+                    valid_split_name=valid_split_name,
                     batch_size=batch_size,
                     seed=seed,
                     dataloader_cfg=dataloader_cfg,
@@ -859,6 +900,8 @@ def main() -> None:
                             "global_token_count": global_token_count,
                         }
                         _append_metrics(metrics_path, train_metrics)
+                        if plot_every > 0 and (step + 1) % plot_every == 0:
+                            _maybe_generate_plots(metrics_path, plots_dir, plot_title_prefix)
                         print(
                             "[metrics][train] "
                             f"step={step + 1} loss={train_loss_value:.4f} "
@@ -889,7 +932,10 @@ def main() -> None:
                             ),
                         )
 
-                if (step + 1) % log_every == 0:
+                if valid_every > 0 and (step + 1) % valid_every == 0:
+                    run_full_validation = full_valid_every > 0 and (step + 1) % full_valid_every == 0
+                    eval_mode = "full" if run_full_validation or max_valid_batches is None else "quick"
+                    eval_max_batches = None if eval_mode == "full" else max_valid_batches
                     _debug_event(
                         "pre_eval",
                         hypothesis_id="D",
@@ -898,6 +944,8 @@ def main() -> None:
                         step=step + 1,
                         epoch=epoch,
                         loss=float(loss.item()),
+                        eval_mode=eval_mode,
+                        max_valid_batches=eval_max_batches,
                     )
                     model.eval()
                     _debug_event(
@@ -907,6 +955,8 @@ def main() -> None:
                         msg="[DEBUG] evaluation started",
                         step=step + 1,
                         epoch=epoch,
+                        eval_mode=eval_mode,
+                        max_valid_batches=eval_max_batches,
                     )
                     valid_metrics = _evaluate(
                         model=model,
@@ -914,6 +964,7 @@ def main() -> None:
                         loss_fn=loss_fn,
                         device=device,
                         precision=precision,
+                        max_batches=eval_max_batches,
                     )
                     valid_loss = float(valid_metrics["valid_loss"])
                     _debug_event(
@@ -924,9 +975,11 @@ def main() -> None:
                         step=step + 1,
                         epoch=epoch,
                         valid_loss=valid_loss,
+                        eval_mode=eval_mode,
+                        valid_batches=float(valid_metrics["valid_batches"]),
                     )
                     if is_main:
-                        if valid_loss < best_valid:
+                        if eval_mode == "full" and valid_loss < best_valid:
                             best_valid = valid_loss
                             save_checkpoint(
                                 out_dir / "best.ckpt",
@@ -945,13 +998,17 @@ def main() -> None:
                             "kind": "valid",
                             "step": step + 1,
                             "epoch": epoch,
+                            "eval_mode": eval_mode,
                             "valid_loss": valid_loss,
                             "valid_masked_accuracy": float(valid_metrics["valid_masked_accuracy"]),
                             "valid_perplexity": float(valid_metrics["valid_perplexity"]),
+                            "valid_batches": int(valid_metrics["valid_batches"]),
                             "best_valid_loss": best_valid,
                             "num_ready_shards": _count_ready_shards(manifest_path),
                         }
                         _append_metrics(metrics_path, eval_record)
+                        if plot_every > 0 and (step + 1) % plot_every == 0:
+                            _maybe_generate_plots(metrics_path, plots_dir, plot_title_prefix)
                         save_checkpoint(
                             out_dir / "last.ckpt",
                             _checkpoint_payload(
@@ -967,9 +1024,11 @@ def main() -> None:
                         )
                         print(
                             "[metrics][valid] "
+                            f"mode={eval_mode} "
                             f"step={step + 1} valid_loss={valid_loss:.4f} "
                             f"valid_masked_acc={float(valid_metrics['valid_masked_accuracy']):.4f} "
                             f"valid_ppl={float(valid_metrics['valid_perplexity']):.4f} "
+                            f"batches={int(valid_metrics['valid_batches'])} "
                             f"best_valid={best_valid:.4f}",
                             flush=True,
                         )
