@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import time
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -54,13 +55,35 @@ def _cleanup_distributed() -> None:
         dist.destroy_process_group()
 
 
+def _rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def _debug_event(event: str, **payload: object) -> None:
+    debug_path = os.environ.get("PRAGMA_DDP_DEBUG_FILE")
+    if not debug_path:
+        return
+    row = {
+        "ts": time.time(),
+        "event": event,
+        "rank": _rank(),
+        **payload,
+    }
+    Path(debug_path).parent.mkdir(parents=True, exist_ok=True)
+    with Path(debug_path).open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def _evaluate(
     model: nn.Module,
     valid_loader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
 ) -> float:
-    losses: list[float] = []
+    total_loss = 0.0
+    total_batches = 0
     with torch.no_grad():
         for batch in valid_loader:
             model_inputs = {
@@ -85,8 +108,14 @@ def _evaluate(
             logits = model(**model_inputs, return_mlm_logits=True)
             mlm_labels = batch["mlm_labels"].to(device, non_blocking=True)
             loss = loss_fn(logits.view(-1, logits.size(-1)), mlm_labels.view(-1))
-            losses.append(float(loss.item()))
-    return float(np.mean(losses)) if losses else float("inf")
+            total_loss += float(loss.item())
+            total_batches += 1
+    if _is_distributed():
+        stats = torch.tensor([total_loss, float(total_batches)], dtype=torch.float64, device=device)
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        total_loss = float(stats[0].item())
+        total_batches = int(stats[1].item())
+    return total_loss / max(total_batches, 1) if total_batches else float("inf")
 
 
 def main() -> None:
@@ -147,30 +176,10 @@ def main() -> None:
     num_workers = int(train_cfg["training"].get("num_workers", 0))
     pin_memory = bool(train_cfg["training"].get("pin_memory", torch.cuda.is_available()))
     train_sampler = None
+    valid_sampler = None
     if _is_distributed():
         train_sampler = DistributedSampler(train_ds, shuffle=True, seed=seed)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        collate_fn=lambda b: pad_collate(b, pad_id=vocab.pad_id),
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
-    )
-    valid_loader = None
-    if not _is_distributed() or is_main:
-        valid_loader = DataLoader(
-            valid_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=lambda b: pad_collate(b, pad_id=vocab.pad_id),
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=num_workers > 0,
-        )
-
+        valid_sampler = DistributedSampler(valid_ds, shuffle=False, seed=seed)
     lr = float(train_cfg["training"].get("learning_rate", 3e-4))
     wd = float(train_cfg["training"].get("weight_decay", 0.01))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
@@ -210,17 +219,16 @@ def main() -> None:
         pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
     )
-    valid_loader = None
-    if not _is_distributed() or is_main:
-        valid_loader = DataLoader(
-            valid_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=valid_collator,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=num_workers > 0,
-        )
+    valid_loader = DataLoader(
+        valid_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=valid_sampler,
+        collate_fn=valid_collator,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
 
     best_valid = float("inf")
     step = 0
@@ -266,16 +274,18 @@ def main() -> None:
                     pbar.set_postfix(train_loss=f"{float(loss.item()):.4f}")
 
                 if (step + 1) % log_every == 0:
-                    if _is_distributed():
-                        dist.barrier()
+                    _debug_event("pre_barrier_eval", step=step + 1, epoch=epoch, loss=float(loss.item()))
+                    _debug_event("post_barrier_eval", step=step + 1, epoch=epoch)
                     model.eval()
-                    if is_main and valid_loader is not None:
-                        valid_loss = _evaluate(
-                            model=model,
-                            valid_loader=valid_loader,
-                            loss_fn=loss_fn,
-                            device=device,
-                        )
+                    _debug_event("eval_start", step=step + 1, epoch=epoch)
+                    valid_loss = _evaluate(
+                        model=model,
+                        valid_loader=valid_loader,
+                        loss_fn=loss_fn,
+                        device=device,
+                    )
+                    _debug_event("eval_end", step=step + 1, epoch=epoch, valid_loss=valid_loss)
+                    if is_main:
                         if valid_loss < best_valid:
                             best_valid = valid_loss
                             save_checkpoint(
@@ -290,8 +300,6 @@ def main() -> None:
                                 },
                             )
                         pbar.set_postfix(train_loss=f"{float(loss.item()):.4f}", valid_loss=f"{valid_loss:.4f}")
-                    if _is_distributed():
-                        dist.barrier()
                     model.train()
 
                 step += 1
