@@ -124,6 +124,77 @@ This benchmark:
 
 The current lite benchmark is designed for reproducible small-scale comparisons. It is the recommended evaluation path for frozen embeddings.
 
+## TransXion Mini And Small
+
+Use the unified shell entry point for the public TransXion benchmark:
+
+```bash
+bash scripts/run_transxion_benchmark.sh <action> <scale>
+```
+
+Scale mapping:
+
+- `mini` -> `data/processed/transxion_200k` for the 0.2M event benchmark
+- `small` -> `data/processed/transxion_full` for the full public TransXion benchmark
+
+Supported actions:
+
+- `download`: download raw public TransXion files only
+- `prepare`: build processed data, splits, tokenizer, and tokenized dataset
+- `train`: launch pretraining
+- `all`: run `prepare` then `train`
+
+Recommended workflow on server:
+
+```bash
+# 1) Mount or download raw public files to data/raw/transxion_public
+ls data/raw/transxion_public
+
+# 2) Prepare the 0.2M benchmark
+bash scripts/run_transxion_benchmark.sh prepare mini
+
+# 3) Prepare the full public benchmark
+bash scripts/run_transxion_benchmark.sh prepare small
+```
+
+Single-GPU training:
+
+```bash
+bash scripts/run_transxion_benchmark.sh train mini
+bash scripts/run_transxion_benchmark.sh train small
+```
+
+Two-GPU DDP training:
+
+```bash
+NPROC_PER_NODE=2 bash scripts/run_transxion_benchmark.sh train mini
+NPROC_PER_NODE=2 bash scripts/run_transxion_benchmark.sh train small
+```
+
+Run prepare + train in one command:
+
+```bash
+NPROC_PER_NODE=2 bash scripts/run_transxion_benchmark.sh all mini
+NPROC_PER_NODE=2 bash scripts/run_transxion_benchmark.sh all small
+```
+
+Default training configs:
+
+- `mini` uses `configs/train/pretrain_mlm_mini.yaml`
+- `small` uses `configs/train/pretrain_mlm_small.yaml`
+- Override with `TRAIN_CONFIG=/path/to/config.yaml`
+
+Useful overrides:
+
+```bash
+MAX_EVENTS=512 \
+MAX_EVENT_TOKENS=24 \
+MAX_PROFILE_TOKENS=200 \
+MINI_TARGET_EVENTS=200000 \
+NPROC_PER_NODE=2 \
+bash scripts/run_transxion_benchmark.sh prepare mini
+```
+
 ## Lite-Scope Deviations
 
 PRA-lite intentionally does not reproduce PRAGMA's large-scale training infrastructure.
