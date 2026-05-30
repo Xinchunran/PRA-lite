@@ -1,28 +1,28 @@
 # PRAGMA Lite
 
-PRAGMA Lite is a lightweight transformer for user-level representation learning on transactional event sequences.
+PRAGMA Lite is a lightweight PRAGMA-inspired transformer for transactional event sequences. It supports structured tokenization, masked pretraining, checkpoint-based inference, and frozen-probe evaluation on public AML-style datasets such as TransXion and IBM AML.
 
-This repository focuses on inference and representation extraction from a pretrained checkpoint. The released model was trained with DDP on 4x NVIDIA RTX A4500 GPUs.
+## Main Entry Points
 
-## What It Does
+- `src/model/pragma_lite/model.py`: model definition
+- `src/inference/predict.py`: batch prediction
+- `src/inference/extract_embeddings.py`: embedding export
+- `src/training/linear_probe.py`: frozen linear probe
+- `scripts/run_lite_benchmark.py`: reproducible evaluation benchmark
+- `scripts/run_transxion_benchmark.sh`: public TransXion prepare/train entry point
+- `scripts/run_ibm_aml_medium_streaming.sh`: IBM AML medium streaming prepare + train entry point
 
-- Encodes a tokenized user sequence into contextual hidden states.
-- Uses the `[USR]` position as the user-level representation.
-- Supports binary prediction export and embedding export from saved checkpoints.
+## Install
 
-## Repository Entry Points
-
-- `src/inference/predict.py`: batch prediction to a parquet file.
-- `src/inference/extract_embeddings.py`: export user representations to a parquet file.
-- `src/model/pragma_lite/model.py`: model definition.
-- `src/training/linear_probe.py`: frozen embedding probe with standard scaling and logistic regression.
-- `scripts/run_lite_benchmark.py`: fixed-seed lite benchmark entry point.
-- `scripts/run_transxion_benchmark.sh`: public TransXion download, prepare, and train entry point.
-- `scripts/run_ibm_aml_medium_streaming.sh`: IBM AML medium shard-streaming prepare + train entry point.
+```bash
+conda create -n pragma-lite python=3.10 -y
+conda activate pragma-lite
+pip install -r requirements.txt
+```
 
 ## Inference
 
-Run batched prediction from a saved checkpoint:
+Run prediction from a saved checkpoint:
 
 ```bash
 python -m src.inference.predict \
@@ -35,17 +35,7 @@ python -m src.inference.predict \
   --device cpu
 ```
 
-Output columns:
-
-- `record_id`
-- `entity_id`
-- `label` if available
-- `probability`
-- `prediction`
-
-## Get Representations
-
-Export one vector per entity:
+Export one embedding per entity:
 
 ```bash
 python -m src.inference.extract_embeddings \
@@ -58,52 +48,11 @@ python -m src.inference.extract_embeddings \
   --device cpu
 ```
 
-The output parquet contains:
-
-- `entity_id`
-- `label` if available
-- `embedding_0 ... embedding_{d_model-1}`
-
-## Representation API
-
-If you want the representation directly in Python, use the structured batch interface and read `zh_usr`, `zh_evt`, or `record_embedding`:
-
-```python
-import torch
-
-from src.model.pragma_lite.model import PragmaLiteModel, PragmaLiteConfig
-from src.training.checkpoint import load_checkpoint
-
-ckpt = load_checkpoint("runs/pretrain_ddp_4gpu_full/best.ckpt", map_location="cpu")
-model = PragmaLiteModel(PragmaLiteConfig(**ckpt["model_cfg"]))
-model.load_state_dict(ckpt["model_state"])
-model.eval()
-
-with torch.no_grad():
-    outputs = model(
-        profile_key_ids=profile_key_ids,
-        profile_value_ids=profile_value_ids,
-        profile_value_pos=profile_value_pos,
-        profile_time=profile_time,
-        profile_mask=profile_mask,
-        event_key_ids=event_key_ids,
-        event_value_ids=event_value_ids,
-        event_value_pos=event_value_pos,
-        event_token_mask=event_token_mask,
-        event_time=event_time,
-        calendar_features=calendar_features,
-        event_mask=event_mask,
-    )
-    user_repr = outputs["zh_usr"]
-    last_event_repr = outputs["zh_evt"][:, -1, :]
-    record_repr = outputs["record_embedding"]
-```
-
-`zh_usr` is the user-level history embedding used by the frozen probe.
+If you need the representation directly in Python, use `zh_usr`, `zh_evt`, or `record_embedding` from the model output.
 
 ## Lite Benchmark
 
-Run a fixed-seed frozen-probe benchmark over a sampled subset:
+Run the fixed-seed frozen-probe benchmark:
 
 ```bash
 python -m scripts.run_lite_benchmark \
@@ -117,98 +66,45 @@ python -m scripts.run_lite_benchmark \
   --device cpu
 ```
 
-This benchmark:
+This benchmark evaluates `zh_usr`, `last_evt`, `concat`, and `record`, then writes predictions and `benchmark_report.json`.
 
-- fixes `seed`, split sampling, and output layout
-- evaluates `zh_usr`, `last_evt`, `concat`, and `record` representations
-- fits `StandardScaler + LogisticRegression(solver="lbfgs")`
-- writes per-representation predictions plus `benchmark_report.json`
+## TransXion
 
-The current lite benchmark is designed for reproducible small-scale comparisons. It is the recommended evaluation path for frozen embeddings.
-
-## TransXion Mini And Small
-
-Use the unified shell entry point for the public TransXion benchmark:
+Use the unified shell entry point:
 
 ```bash
 bash scripts/run_transxion_benchmark.sh <action> <scale>
 ```
 
-Scale mapping:
-
-- `mini` -> `data/processed/transxion_200k` for the 0.2M event benchmark
-- `small` -> `data/processed/transxion_full` for the full public TransXion benchmark
-
 Supported actions:
 
-- `download`: download raw public TransXion files only
-- `prepare`: build processed data, splits, tokenizer, and tokenized dataset
-- `train`: launch pretraining
-- `all`: run `prepare` then `train`
+- `download`
+- `prepare`
+- `train`
+- `all`
 
-Recommended workflow on server:
+Supported scales:
+
+- `mini`
+- `small`
+
+Examples:
 
 ```bash
-# 1) Mount or download raw public files to data/raw/transxion_public
-ls data/raw/transxion_public
-
-# 2) Prepare the 0.2M benchmark
 bash scripts/run_transxion_benchmark.sh prepare mini
-
-# 3) Prepare the full public benchmark
 bash scripts/run_transxion_benchmark.sh prepare small
-```
-
-Single-GPU training:
-
-```bash
-bash scripts/run_transxion_benchmark.sh train mini
-bash scripts/run_transxion_benchmark.sh train small
-```
-
-Two-GPU DDP training:
-
-```bash
-NPROC_PER_NODE=2 bash scripts/run_transxion_benchmark.sh train mini
 NPROC_PER_NODE=2 bash scripts/run_transxion_benchmark.sh train small
-```
-
-Run prepare + train in one command:
-
-```bash
-NPROC_PER_NODE=2 bash scripts/run_transxion_benchmark.sh all mini
-NPROC_PER_NODE=2 bash scripts/run_transxion_benchmark.sh all small
-```
-
-Default training configs:
-
-- `mini` uses `configs/train/pretrain_mlm_mini.yaml`
-- `small` uses `configs/train/pretrain_mlm_small.yaml`
-- Override with `TRAIN_CONFIG=/path/to/config.yaml`
-
-Useful overrides:
-
-```bash
-MAX_EVENTS=512 \
-MAX_EVENT_TOKENS=24 \
-MAX_PROFILE_TOKENS=200 \
-MINI_TARGET_EVENTS=200000 \
-NPROC_PER_NODE=2 \
-bash scripts/run_transxion_benchmark.sh prepare mini
 ```
 
 ## IBM AML
 
-IBM AML support is built around the public Kaggle release of the IBM AML synthetic transactions benchmark. The current pipeline converts the raw transaction CSV into PRAGMA-lite `profiles/events/labels`, builds a tokenizer, encodes LMDB shards, and trains with DDP.
-
-Download from Kaggle:
+Download the Kaggle files:
 
 ```bash
 conda activate pragma-lite
 
 KAGGLE_FILE=LI-Small_Trans.csv bash scripts/download_ibm_aml_kaggle.sh
 KAGGLE_FILE=LI-Small_accounts.csv bash scripts/download_ibm_aml_kaggle.sh
-
 KAGGLE_FILE=LI-Medium_Trans.csv bash scripts/download_ibm_aml_kaggle.sh
 KAGGLE_FILE=LI-Medium_accounts.csv bash scripts/download_ibm_aml_kaggle.sh
 ```
@@ -219,25 +115,13 @@ Prepare a static LMDB dataset:
 RAW_CSV=LI-Small_Trans.csv bash scripts/prepare_ibm_aml_lmdb.sh
 ```
 
-Train on a prepared IBM AML LMDB dataset:
+Train on IBM AML:
 
 ```bash
 TRAIN_BATCH_SIZE=16 bash scripts/train_ibm_aml_lmdb.sh
 ```
 
-### IBM AML Medium Streaming
-
-For `LI-Medium`, the repository also supports a shard-streaming workflow that overlaps CPU-side prepare with GPU-side training.
-
-What it does:
-
-- splits the raw medium CSV into shard CSV files;
-- bootstraps the tokenizer from the first shard;
-- converts and encodes each shard into LMDB;
-- writes a shard `manifest.json`;
-- starts 4-GPU bf16 training and reloads newly finished shards at epoch boundaries.
-
-Run the streaming pipeline:
+For medium-scale streaming prepare + train:
 
 ```bash
 conda activate pragma-lite
@@ -255,32 +139,8 @@ TOKENIZE_NUM_WORKERS=8 \
 bash scripts/run_ibm_aml_medium_streaming.sh
 ```
 
-If raw shards already exist, the script skips the CSV split step and resumes from shard preparation and training.
-
-## Lite-Scope Deviations
-
-PRA-lite intentionally does not reproduce PRAGMA's large-scale training infrastructure.
-For small reproducible benchmarks, we use:
-
-- AdamW instead of Muon + AdamW
-- fixed batch size instead of token-budget dynamic batching
-- padded tensors instead of sequence packing with varlen attention
-- local Parquet datasets instead of LMDB user index + event-count shards
-
-These choices affect training efficiency, not the core architectural hypothesis.
-The benchmark therefore evaluates whether PRAGMA-style key-value-time tokenization,
-profile/event/history encoders, masked event modeling, and frozen user embeddings
-are useful on small public transaction datasets.
-
-## Probe Notes
-
-- `src/training/linear_probe.py` now runs a frozen probe, not end-to-end finetuning.
-- Supported representation choices are `zh_usr`, `last_evt`, `concat`, and `record`.
-- The current downstream probe is closer to PRAGMA Section 3.1 than a trainable linear head.
-- LoRA-style adaptation is not implemented yet; treat it as future work for a closer Section 3.1 match.
-
 ## Notes
 
 - `--split all` runs on the full tokenized dataset without split filtering.
-- If `--split_dir` is omitted, the inference scripts try to infer it from `--data_dir`.
+- If `--split_dir` is omitted, inference scripts try to infer it from `--data_dir`.
 - Checkpoints store both model weights and the tokenizer path used during training.
