@@ -109,6 +109,7 @@ def test_larger_dataset_scripts_and_config_exist() -> None:
         "scripts/download_transxion_public.sh",
         "scripts/download_paysim.sh",
         "scripts/download_elliptic.sh",
+        "scripts/download_hf_public_datasets.sh",
         "scripts/download_fdb.sh",
         "scripts/run_transxion_benchmark.sh",
         "configs/data/transxion_public.yaml",
