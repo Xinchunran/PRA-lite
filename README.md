@@ -17,6 +17,8 @@ This repository focuses on inference and representation extraction from a pretra
 - `src/model/pragma_lite/model.py`: model definition.
 - `src/training/linear_probe.py`: frozen embedding probe with standard scaling and logistic regression.
 - `scripts/run_lite_benchmark.py`: fixed-seed lite benchmark entry point.
+- `scripts/run_transxion_benchmark.sh`: public TransXion download, prepare, and train entry point.
+- `scripts/run_ibm_aml_medium_streaming.sh`: IBM AML medium shard-streaming prepare + train entry point.
 
 ## Inference
 
@@ -194,6 +196,66 @@ MINI_TARGET_EVENTS=200000 \
 NPROC_PER_NODE=2 \
 bash scripts/run_transxion_benchmark.sh prepare mini
 ```
+
+## IBM AML
+
+IBM AML support is built around the public Kaggle release of the IBM AML synthetic transactions benchmark. The current pipeline converts the raw transaction CSV into PRAGMA-lite `profiles/events/labels`, builds a tokenizer, encodes LMDB shards, and trains with DDP.
+
+Download from Kaggle:
+
+```bash
+conda activate pragma-lite
+
+KAGGLE_FILE=LI-Small_Trans.csv bash scripts/download_ibm_aml_kaggle.sh
+KAGGLE_FILE=LI-Small_accounts.csv bash scripts/download_ibm_aml_kaggle.sh
+
+KAGGLE_FILE=LI-Medium_Trans.csv bash scripts/download_ibm_aml_kaggle.sh
+KAGGLE_FILE=LI-Medium_accounts.csv bash scripts/download_ibm_aml_kaggle.sh
+```
+
+Prepare a static LMDB dataset:
+
+```bash
+RAW_CSV=LI-Small_Trans.csv bash scripts/prepare_ibm_aml_lmdb.sh
+```
+
+Train on a prepared IBM AML LMDB dataset:
+
+```bash
+TRAIN_BATCH_SIZE=16 bash scripts/train_ibm_aml_lmdb.sh
+```
+
+### IBM AML Medium Streaming
+
+For `LI-Medium`, the repository also supports a shard-streaming workflow that overlaps CPU-side prepare with GPU-side training.
+
+What it does:
+
+- splits the raw medium CSV into shard CSV files;
+- bootstraps the tokenizer from the first shard;
+- converts and encodes each shard into LMDB;
+- writes a shard `manifest.json`;
+- starts 4-GPU bf16 training and reloads newly finished shards at epoch boundaries.
+
+Run the streaming pipeline:
+
+```bash
+conda activate pragma-lite
+bash scripts/run_ibm_aml_medium_streaming.sh
+```
+
+Useful overrides:
+
+```bash
+ROWS_PER_SHARD=250000 \
+TRAIN_BATCH_SIZE=16 \
+NPROC_PER_NODE=4 \
+PRECISION=bf16 \
+TOKENIZE_NUM_WORKERS=8 \
+bash scripts/run_ibm_aml_medium_streaming.sh
+```
+
+If raw shards already exist, the script skips the CSV split step and resumes from shard preparation and training.
 
 ## Lite-Scope Deviations
 
