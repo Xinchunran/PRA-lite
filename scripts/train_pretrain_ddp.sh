@@ -4,6 +4,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-$(command -v torchrun)}"
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "Cannot resolve python interpreter. Set PYTHON_BIN explicitly." >&2
+  exit 1
+fi
+if [[ -z "${TORCHRUN_BIN}" ]]; then
+  echo "Cannot resolve torchrun binary. Set TORCHRUN_BIN explicitly." >&2
+  exit 1
+fi
 
 CONFIG="${CONFIG:-configs/train/pretrain_mlm.yaml}"
 MODEL_CONFIG="${MODEL_CONFIG:-configs/model/pragma_lite_small.yaml}"
@@ -11,6 +22,8 @@ DATA_DIR="${DATA_DIR:-data/tokenized/transxion}"
 SPLIT_DIR="${SPLIT_DIR:-data/splits/transxion}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/pretrain_ddp}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-}"
+MANIFEST_PATH="${MANIFEST_PATH:-}"
+RESUME_FROM="${RESUME_FROM:-}"
 PROCESSED_DIR="${PROCESSED_DIR:-}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 BACKEND="${BACKEND:-nccl}"
@@ -23,13 +36,13 @@ if [[ "${CHECK_SPLITS}" == "1" ]]; then
     echo "CHECK_SPLITS=1 时必须提供 PROCESSED_DIR" >&2
     exit 1
   fi
-  python -m src.splitter.check_splits \
+  "${PYTHON_BIN}" -m src.splitter.check_splits \
     --processed_dir "${PROCESSED_DIR}" \
     --split_dir "${SPLIT_DIR}"
 fi
 
 CMD=(
-  torchrun
+  "${TORCHRUN_BIN}"
   --standalone
   --nnodes=1
   --nproc_per_node="${NPROC_PER_NODE}"
@@ -47,6 +60,16 @@ if [[ -n "${TOKENIZER_DIR}" ]]; then
   CMD+=(--tokenizer_dir "${TOKENIZER_DIR}")
 fi
 
+if [[ -n "${MANIFEST_PATH}" ]]; then
+  CMD+=(--manifest_path "${MANIFEST_PATH}")
+fi
+
+if [[ -n "${RESUME_FROM}" ]]; then
+  CMD+=(--resume_from "${RESUME_FROM}")
+fi
+
+echo "Using PYTHON_BIN=${PYTHON_BIN}"
+echo "Using TORCHRUN_BIN=${TORCHRUN_BIN}"
 echo "Launching DDP pretraining with ${NPROC_PER_NODE} process(es)"
 printf ' %q' "${CMD[@]}"
 printf '\n'

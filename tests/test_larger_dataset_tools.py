@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -9,11 +10,14 @@ from src.common.yaml_utils import load_yaml
 from src.data_downloader.build_events import build_transxion_events
 from src.tokenizer.build_vocab import main as build_vocab_main
 from src.tokenizer.encode_dataset import main as encode_dataset_main
+from src.training.data import load_tokenized_manifest_split
 from tools.convert_elliptic_to_pralite import convert_elliptic_to_pralite
+from tools.convert_ibm_aml_to_pralite import convert_ibm_aml_to_pralite
 from tools.convert_paysim_to_pralite import convert_paysim_to_pralite
 from tools.make_entity_event_cut import make_entity_event_cut
 from tools.make_entity_splits import make_entity_splits
 from tools.prepare_transxion_public_raw import prepare_transxion_public_raw
+from tools.split_ibm_aml_csv import split_ibm_aml_csv
 
 
 REQUIRED_TOKENIZED_COLUMNS = {
@@ -449,3 +453,173 @@ def test_convert_elliptic_pipeline_generates_labeled_graph_adaptation(tmp_path: 
     tokenized = _tokenize_processed_dir(processed_dir, monkeypatch, max_events=6)
     assert REQUIRED_TOKENIZED_COLUMNS.issubset(tokenized.columns)
     assert len(tokenized) == len(labels)
+
+
+def test_convert_ibm_aml_pipeline_generates_account_histories(tmp_path: Path, monkeypatch) -> None:
+    raw_dir = tmp_path / "raw" / "ibm_aml"
+    raw_dir.mkdir(parents=True)
+    raw_csv = raw_dir / "LI-Small_Trans.csv"
+    pd.DataFrame(
+        [
+            {
+                "Timestamp": "2022-09-01 00:00:00",
+                "From Bank": "B1",
+                "From Account": "A1",
+                "To Bank": "B2",
+                "To Account": "A2",
+                "Amount Paid": 10.0,
+                "Amount Received": 10.0,
+                "Payment Currency": "USD",
+                "Receiving Currency": "USD",
+                "Payment Format": "WIRE",
+                "Is Laundering": 0,
+            },
+            {
+                "Timestamp": "2022-09-01 01:00:00",
+                "From Bank": "B2",
+                "From Account": "A2",
+                "To Bank": "B3",
+                "To Account": "A3",
+                "Amount Paid": 12.5,
+                "Amount Received": 12.0,
+                "Payment Currency": "USD",
+                "Receiving Currency": "EUR",
+                "Payment Format": "ACH",
+                "Is Laundering": 1,
+            },
+            {
+                "Timestamp": "2022-09-01 02:00:00",
+                "From Bank": "B1",
+                "From Account": "A1",
+                "To Bank": "B3",
+                "To Account": "A3",
+                "Amount Paid": 5.0,
+                "Amount Received": 5.0,
+                "Payment Currency": "USD",
+                "Receiving Currency": "USD",
+                "Payment Format": "CARD",
+                "Is Laundering": 0,
+            },
+        ]
+    ).to_csv(raw_csv, index=False)
+
+    processed_dir = tmp_path / "processed" / "ibm_aml_full"
+    convert_ibm_aml_to_pralite(raw_dir, processed_dir)
+
+    profiles = pd.read_parquet(processed_dir / "profiles.parquet")
+    events = pd.read_parquet(processed_dir / "events.parquet")
+    labels = pd.read_parquet(processed_dir / "labels.parquet")
+
+    assert {"entity_id", "event_id", "timestamp", "direction", "counterparty_id"}.issubset(events.columns)
+    assert {"entity_id", "label", "evaluation_time"}.issubset(labels.columns)
+    assert {"entity_id", "tx_count", "sent_tx_count", "recv_tx_count"}.issubset(profiles.columns)
+    assert len(events) == 6
+    assert labels["label"].sum() >= 1
+
+    split_dir = tmp_path / "splits" / "ibm_aml_full"
+    make_entity_splits(processed_dir / "labels.parquet", split_dir, seed=7, train_frac=0.5, valid_frac=0.25)
+    _assert_split_outputs(processed_dir / "labels.parquet", split_dir)
+
+    tokenized = _tokenize_processed_dir(processed_dir, monkeypatch, max_events=6)
+    assert REQUIRED_TOKENIZED_COLUMNS.issubset(tokenized.columns)
+    assert len(tokenized) == len(labels)
+
+
+def test_ibm_aml_shards_and_manifest_loader_work(tmp_path: Path, monkeypatch) -> None:
+    raw_dir = tmp_path / "raw" / "ibm_aml"
+    raw_dir.mkdir(parents=True)
+    raw_csv = raw_dir / "LI-Medium_Trans.csv"
+    rows = []
+    for idx in range(24):
+        rows.append(
+            {
+                "Timestamp": f"2022-09-01 {idx % 24:02d}:00:00",
+                "From Bank": f"B{idx % 3}",
+                "From Account": f"A{idx}",
+                "To Bank": f"B{(idx + 1) % 3}",
+                "To Account": f"A{idx + 100}",
+                "Amount Paid": float(10 + idx),
+                "Amount Received": float(9 + idx),
+                "Payment Currency": "USD",
+                "Receiving Currency": "USD",
+                "Payment Format": "WIRE" if idx % 2 == 0 else "ACH",
+                "Is Laundering": int(idx % 5 == 0),
+            }
+        )
+    pd.DataFrame(rows).to_csv(raw_csv, index=False)
+
+    shard_dir = tmp_path / "raw_shards"
+    split_ibm_aml_csv(raw_csv, shard_dir, rows_per_shard=8)
+    shard_paths = sorted(shard_dir.glob("shard_*.csv"))
+    assert len(shard_paths) == 3
+
+    tokenizer_dir = tmp_path / "tokenizer"
+    tokenized_dirs: list[Path] = []
+    for shard_idx, shard_path in enumerate(shard_paths):
+        processed_dir = tmp_path / "processed" / shard_path.stem
+        convert_ibm_aml_to_pralite(raw_dir, processed_dir, raw_csv=str(shard_path))
+        if shard_idx == 0:
+            monkeypatch.setattr(
+                sys,
+                "argv",
+                [
+                    "build_vocab",
+                    "--processed_dir",
+                    str(processed_dir),
+                    "--output_dir",
+                    str(tokenizer_dir),
+                    "--num_buckets",
+                    "8",
+                    "--min_freq",
+                    "1",
+                ],
+            )
+            build_vocab_main()
+        tokenized_dir = tmp_path / "tokenized" / shard_path.stem
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "encode_dataset",
+                "--processed_dir",
+                str(processed_dir),
+                "--tokenizer_dir",
+                str(tokenizer_dir),
+                "--output_dir",
+                str(tokenized_dir),
+                "--backend",
+                "lmdb",
+                "--max_events",
+                "8",
+                "--max_event_tokens",
+                "12",
+                "--max_profile_tokens",
+                "32",
+                "--hash_split_seed",
+                "26",
+                "--train_frac",
+                "0.7",
+                "--valid_frac",
+                "0.2",
+            ],
+        )
+        encode_dataset_main()
+        tokenized_dirs.append(tokenized_dir)
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "tokenizer_dir": str(tokenizer_dir),
+                "shards": [
+                    {"name": path.name, "tokenized_dir": str(path), "status": "ready"} for path in tokenized_dirs
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    train_ds = load_tokenized_manifest_split(manifest_path, "train")
+    valid_ds = load_tokenized_manifest_split(manifest_path, "valid")
+    assert len(train_ds) > 0
+    assert len(valid_ds) > 0

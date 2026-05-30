@@ -26,8 +26,19 @@ def calendar_features(ts: pd.Timestamp) -> list[float]:
 
 
 def relative_time_feature(event_ts: pd.Timestamp, evaluation_ts: pd.Timestamp) -> float:
-    delta_seconds = max(0.0, (evaluation_ts - event_ts).total_seconds())
+    try:
+        delta_seconds = max(0.0, (evaluation_ts - event_ts).total_seconds())
+    except Exception:
+        return 0.0
     return float(soft_log_seconds(delta_seconds))
+
+
+def _is_time_like_column(col: str) -> bool:
+    normalized = col.strip().lower()
+    return any(
+        token in normalized
+        for token in ("time", "timestamp", "date", "seen")
+    )
 
 
 def _maybe_parse_ts(value: Any) -> pd.Timestamp | None:
@@ -91,7 +102,7 @@ def encode_profile_features(
         value_ids.append(_encode_value(vocab, "P", col, value))
         value_pos.append(0)
 
-        parsed_ts = _maybe_parse_ts(value)
+        parsed_ts = _maybe_parse_ts(value) if _is_time_like_column(col) else None
         if parsed_ts is not None:
             profile_time.append(relative_time_feature(parsed_ts, evaluation_time))
         else:

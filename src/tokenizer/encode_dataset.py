@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import multiprocessing
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -109,10 +110,22 @@ def _load_split_ids(split_dir: Path | None) -> dict[str, set[int]]:
     return split_ids
 
 
+def _hash_split_name(entity_id: int, seed: int, train_frac: float, valid_frac: float) -> str:
+    key = f"{seed}:{int(entity_id)}".encode("utf-8")
+    digest = hashlib.blake2b(key, digest_size=8).digest()
+    score = int.from_bytes(digest, byteorder="big", signed=False) / float(2**64)
+    if score < train_frac:
+        return "train"
+    if score < train_frac + valid_frac:
+        return "valid"
+    return "test"
+
+
 def _build_lmdb_writers(
     out_dir: Path,
     backend: str,
     split_ids: dict[str, set[int]],
+    use_hash_split: bool,
     map_size_gb: int,
     commit_interval: int,
 ) -> tuple[TokenizedLmdbWriter | None, dict[str, TokenizedLmdbWriter]]:
@@ -120,8 +133,9 @@ def _build_lmdb_writers(
     if backend in {"lmdb", "both"}:
         dataset_writer = TokenizedLmdbWriter(out_dir / "dataset.lmdb", map_size_gb=map_size_gb, commit_interval=commit_interval)
     split_writers: dict[str, TokenizedLmdbWriter] = {}
-    if backend in {"lmdb", "both"} and split_ids:
-        for split_name in split_ids:
+    if backend in {"lmdb", "both"} and (split_ids or use_hash_split):
+        split_names = split_ids.keys() if split_ids else ("train", "valid", "test")
+        for split_name in split_names:
             split_writers[split_name] = TokenizedLmdbWriter(
                 out_dir / f"{split_name}.lmdb",
                 map_size_gb=map_size_gb,
@@ -135,10 +149,18 @@ def _route_row_to_lmdb(
     dataset_writer: TokenizedLmdbWriter | None,
     split_writers: dict[str, TokenizedLmdbWriter],
     split_ids: dict[str, set[int]],
+    hash_split_seed: int | None,
+    train_frac: float,
+    valid_frac: float,
 ) -> None:
     if dataset_writer is not None:
         dataset_writer.write(row)
     entity_id = int(row["entity_id"])
+    if hash_split_seed is not None:
+        split_name = _hash_split_name(entity_id, hash_split_seed, train_frac, valid_frac)
+        if split_name in split_writers:
+            split_writers[split_name].write(row)
+        return
     for split_name, ids in split_ids.items():
         if entity_id in ids and split_name in split_writers:
             split_writers[split_name].write(row)
@@ -167,6 +189,9 @@ def main() -> None:
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--lmdb_map_size_gb", type=int, default=64)
     parser.add_argument("--lmdb_commit_interval", type=int, default=1024)
+    parser.add_argument("--hash_split_seed", type=int, default=None)
+    parser.add_argument("--train_frac", type=float, default=0.8)
+    parser.add_argument("--valid_frac", type=float, default=0.1)
 
     args = parser.parse_args()
     processed_dir = Path(args.processed_dir)
@@ -192,10 +217,12 @@ def main() -> None:
     payloads = _make_payloads(profiles=profiles, events=events, labels=labels, max_events=args.max_events)
     split_dir = Path(args.split_dir) if args.split_dir else None
     split_ids = _load_split_ids(split_dir)
+    use_hash_split = args.hash_split_seed is not None
     dataset_writer, split_writers = _build_lmdb_writers(
         out_dir=out_dir,
         backend=args.backend,
         split_ids=split_ids,
+        use_hash_split=use_hash_split,
         map_size_gb=args.lmdb_map_size_gb,
         commit_interval=args.lmdb_commit_interval,
     )
@@ -209,7 +236,15 @@ def main() -> None:
             for row in tqdm(iterator, desc="encode", total=len(payloads)):
                 if rows is not None:
                     rows.append(row)
-                _route_row_to_lmdb(row, dataset_writer, split_writers, split_ids)
+                _route_row_to_lmdb(
+                    row,
+                    dataset_writer,
+                    split_writers,
+                    split_ids,
+                    args.hash_split_seed,
+                    args.train_frac,
+                    args.valid_frac,
+                )
         else:
             mp_context = _resolve_mp_context(num_workers)
             with ProcessPoolExecutor(
@@ -222,7 +257,15 @@ def main() -> None:
                 for row in tqdm(iterator, desc="encode", total=len(payloads)):
                     if rows is not None:
                         rows.append(row)
-                    _route_row_to_lmdb(row, dataset_writer, split_writers, split_ids)
+                    _route_row_to_lmdb(
+                        row,
+                        dataset_writer,
+                        split_writers,
+                        split_ids,
+                        args.hash_split_seed,
+                        args.train_frac,
+                        args.valid_frac,
+                    )
     finally:
         _close_lmdb_writers(dataset_writer, split_writers)
 
@@ -243,6 +286,9 @@ def main() -> None:
             "max_events": int(args.max_events),
             "row_group_size": row_group_size,
             "backend": args.backend,
+            "hash_split_seed": args.hash_split_seed,
+            "train_frac": float(args.train_frac),
+            "valid_frac": float(args.valid_frac),
         },
     )
 

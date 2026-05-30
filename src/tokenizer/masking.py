@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import time
+import urllib.request
 
 import numpy as np
 import torch
@@ -20,6 +25,39 @@ class MaskedEventCollator:
 
     def __post_init__(self) -> None:
         self.rng = np.random.default_rng(self.seed)
+        self._debug_calls = 0
+
+    def _debug_event(self, event: str, **payload: object) -> None:
+        env_path = Path(os.environ.get("PRAGMA_DEBUG_ENV_FILE", ".dbg/pretrain-slow.env"))
+        url = "http://127.0.0.1:7777/event"
+        session_id = "pretrain-slow"
+        run_id = os.environ.get("PRAGMA_DEBUG_RUN_ID", "pre-fix")
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("DEBUG_SERVER_URL="):
+                    url = line.split("=", 1)[1].strip() or url
+                elif line.startswith("DEBUG_SESSION_ID="):
+                    session_id = line.split("=", 1)[1].strip() or session_id
+        body = {
+            "sessionId": session_id,
+            "runId": run_id,
+            "hypothesisId": "B",
+            "location": "src/tokenizer/masking.py",
+            "msg": f"[DEBUG] {event}",
+            "data": payload,
+            "ts": int(time.time() * 1000),
+        }
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    url,
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                ),
+                timeout=0.25,
+            ).read()
+        except Exception:
+            return
 
     def _normalize(self, value: object, dtype: np.dtype) -> np.ndarray:
         if hasattr(value, "tolist"):
@@ -62,6 +100,9 @@ class MaskedEventCollator:
         return mlm_mask, unk_mask
 
     def __call__(self, batch: list[dict]) -> dict[str, torch.Tensor]:
+        # #region debug-point B:collate-timing
+        collate_started_at = time.perf_counter()
+        # #endregion
         out_rows: dict[str, list[torch.Tensor]] = {
             "entity_id": [],
             "profile_key_ids": [],
@@ -112,5 +153,17 @@ class MaskedEventCollator:
             out_rows["mlm_labels"].append(torch.tensor(mlm_labels))
             out_rows["unk_mask"].append(torch.tensor(unk_mask))
             out_rows["label"].append(torch.tensor(int(record.get("label", 0)), dtype=torch.long))
-
-        return {key: torch.stack(values, dim=0) for key, values in out_rows.items()}
+        stacked = {key: torch.stack(values, dim=0) for key, values in out_rows.items()}
+        # #region debug-point B:collate-timing
+        self._debug_calls += 1
+        if self._debug_calls <= 5 or self._debug_calls % 50 == 0:
+            self._debug_event(
+                "collate_timing",
+                call_index=self._debug_calls,
+                batch_size=len(batch),
+                event_shape=list(stacked["event_value_ids"].shape),
+                profile_shape=list(stacked["profile_value_ids"].shape),
+                elapsed_s=round(time.perf_counter() - collate_started_at, 4),
+            )
+        # #endregion
+        return stacked

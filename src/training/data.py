@@ -3,20 +3,28 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections import OrderedDict
 from dataclasses import dataclass
+import json
+import os
 from pathlib import Path
 import pickle
+import time
 from typing import Any
+import urllib.request
 
 import numpy as np
 import pyarrow.parquet as pq
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset
+
+from src.common.fs import read_json
 from src.common.tokenized_lmdb import format_lmdb_key
 
 try:
     import lmdb
-except ModuleNotFoundError:  # pragma: no cover - exercised when lmdb backend is unavailable
+    _LMDB_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - exercised when lmdb backend is unavailable or broken
     lmdb = None
+    _LMDB_IMPORT_ERROR = exc
 
 REQUIRED_TOKENIZED_COLUMNS = {
     "profile_key_ids",
@@ -47,6 +55,39 @@ def read_ids(path: str | Path) -> set[int]:
 
 def _as_python(value: object) -> object:
     return value.as_py() if hasattr(value, "as_py") else value
+
+
+def _debug_event(event: str, hypothesis_id: str, location: str, **payload: object) -> None:
+    env_path = Path(os.environ.get("PRAGMA_DEBUG_ENV_FILE", ".dbg/pretrain-slow.env"))
+    url = "http://127.0.0.1:7777/event"
+    session_id = "pretrain-slow"
+    run_id = os.environ.get("PRAGMA_DEBUG_RUN_ID", "pre-fix")
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("DEBUG_SERVER_URL="):
+                url = line.split("=", 1)[1].strip() or url
+            elif line.startswith("DEBUG_SESSION_ID="):
+                session_id = line.split("=", 1)[1].strip() or session_id
+    body = {
+        "sessionId": session_id,
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "msg": f"[DEBUG] {event}",
+        "data": payload,
+        "ts": int(time.time() * 1000),
+    }
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.25,
+        ).read()
+    except Exception:
+        return
 
 
 def load_tokenized_dataset(
@@ -87,6 +128,33 @@ def load_tokenized_split(data_dir: str | Path, split_name: str, split_dir: str |
     return load_tokenized_dataset(data_dir, split_name=split_name, split_dir=split_dir)
 
 
+def load_tokenized_manifest_split(manifest_path: str | Path, split_name: str) -> Dataset:
+    manifest = read_json(manifest_path)
+    shard_entries = manifest.get("shards", [])
+    datasets: list[Dataset] = []
+    for entry in shard_entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status", "ready")) != "ready":
+            continue
+        tokenized_dir_raw = entry.get("tokenized_dir")
+        if not tokenized_dir_raw:
+            continue
+        tokenized_dir = Path(str(tokenized_dir_raw))
+        split_lmdb_path = tokenized_dir / f"{split_name}.lmdb"
+        if split_lmdb_path.exists():
+            datasets.append(LmdbTokenizedDataset(split_lmdb_path))
+            continue
+        split_parquet_path = tokenized_dir / f"{split_name}.parquet"
+        if split_parquet_path.exists():
+            datasets.append(TokenizedDataset(split_parquet_path))
+    if not datasets:
+        raise FileNotFoundError(f"Manifest {manifest_path} has no ready shard for split {split_name}")
+    if len(datasets) == 1:
+        return datasets[0]
+    return ConcatDataset(datasets)
+
+
 @dataclass(frozen=True)
 class Batch:
     entity_id: torch.Tensor
@@ -123,6 +191,9 @@ class Batch:
 
 class TokenizedDataset(Dataset):
     def __init__(self, data_path: Path, entity_ids: set[int] | None = None, max_cached_row_groups: int = 2) -> None:
+        # #region debug-point A:tokenized-dataset-init
+        init_started_at = time.perf_counter()
+        # #endregion
         self.data_path = Path(data_path)
         self._parquet = pq.ParquetFile(self.data_path)
         schema_names = set(self._parquet.schema_arrow.names)
@@ -168,6 +239,19 @@ class TokenizedDataset(Dataset):
             self._num_rows = len(self._entity_row_index)
         self._max_cached_row_groups = max(1, int(max_cached_row_groups))
         self._row_group_cache: OrderedDict[int, dict[str, list[object]]] = OrderedDict()
+        self._debug_logged_row_groups: set[int] = set()
+        # #region debug-point A:tokenized-dataset-init
+        _debug_event(
+            "tokenized_dataset_init",
+            "A",
+            "src/training/data.py:127",
+            path=str(self.data_path),
+            row_groups=self._parquet.num_row_groups,
+            num_rows=self._num_rows,
+            filtered=entity_ids is not None,
+            elapsed_s=round(time.perf_counter() - init_started_at, 4),
+        )
+        # #endregion
 
     def __len__(self) -> int:
         return self._num_rows
@@ -188,11 +272,28 @@ class TokenizedDataset(Dataset):
         if cached is not None:
             self._row_group_cache.move_to_end(row_group_idx)
             return cached
+        # #region debug-point C:row-group-read
+        load_started_at = time.perf_counter()
+        # #endregion
         table = self._parquet.read_row_group(row_group_idx, columns=self._columns)
         row_group_data = {column: values for column, values in table.to_pydict().items()}
         self._row_group_cache[row_group_idx] = row_group_data
         if len(self._row_group_cache) > self._max_cached_row_groups:
             self._row_group_cache.popitem(last=False)
+        # #region debug-point C:row-group-read
+        if len(self._debug_logged_row_groups) < 5 and row_group_idx not in self._debug_logged_row_groups:
+            self._debug_logged_row_groups.add(row_group_idx)
+            _debug_event(
+                "parquet_row_group_loaded",
+                "C",
+                "src/training/data.py:188",
+                path=str(self.data_path),
+                row_group_idx=row_group_idx,
+                rows=len(next(iter(row_group_data.values()))) if row_group_data else 0,
+                cache_size=len(self._row_group_cache),
+                elapsed_s=round(time.perf_counter() - load_started_at, 4),
+            )
+        # #endregion
         return row_group_data
 
     def __getitem__(self, idx: int) -> dict:
@@ -220,8 +321,15 @@ class TokenizedDataset(Dataset):
 
 class LmdbTokenizedDataset(Dataset):
     def __init__(self, lmdb_path: Path, entity_ids: set[int] | None = None) -> None:
+        # #region debug-point A:lmdb-dataset-init
+        init_started_at = time.perf_counter()
+        # #endregion
         if lmdb is None:
-            raise ModuleNotFoundError("lmdb is required for the LMDB backend. Install it with `pip install lmdb`.")
+            detail = f" Original import error: {_LMDB_IMPORT_ERROR!r}" if _LMDB_IMPORT_ERROR is not None else ""
+            raise ModuleNotFoundError(
+                "lmdb is required for the LMDB backend. Install a working `lmdb` package or use the parquet backend."
+                f"{detail}"
+            )
         self.lmdb_path = Path(lmdb_path)
         self._env: Any = None
         entity_id_path = self.lmdb_path / "entity_ids.npy"
@@ -236,6 +344,18 @@ class LmdbTokenizedDataset(Dataset):
                 [idx for idx, entity_id in enumerate(self._all_entity_ids.tolist()) if int(entity_id) in allowed],
                 dtype=np.int64,
             )
+        self._debug_get_count = 0
+        # #region debug-point A:lmdb-dataset-init
+        _debug_event(
+            "lmdb_dataset_init",
+            "A",
+            "src/training/data.py:224",
+            path=str(self.lmdb_path),
+            num_rows=int(len(self._indices)),
+            filtered=entity_ids is not None,
+            elapsed_s=round(time.perf_counter() - init_started_at, 4),
+        )
+        # #endregion
 
     def __getstate__(self) -> dict[str, object]:
         state = self.__dict__.copy()
@@ -259,12 +379,28 @@ class LmdbTokenizedDataset(Dataset):
         return self._env
 
     def __getitem__(self, idx: int) -> dict:
+        # #region debug-point C:lmdb-read
+        read_started_at = time.perf_counter()
+        # #endregion
         real_idx = int(self._indices[idx])
         with self._get_env().begin(write=False) as txn:
             payload = txn.get(format_lmdb_key(real_idx))
         if payload is None:
             raise KeyError(real_idx)
-        return pickle.loads(payload)
+        row = pickle.loads(payload)
+        # #region debug-point C:lmdb-read
+        self._debug_get_count += 1
+        if self._debug_get_count <= 5:
+            _debug_event(
+                "lmdb_item_loaded",
+                "C",
+                "src/training/data.py:267",
+                path=str(self.lmdb_path),
+                index=real_idx,
+                elapsed_s=round(time.perf_counter() - read_started_at, 4),
+            )
+        # #endregion
+        return row
 
 
 def pad_collate(batch: list[dict], pad_id: int) -> Batch:

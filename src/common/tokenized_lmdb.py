@@ -8,8 +8,10 @@ import numpy as np
 
 try:
     import lmdb
-except ModuleNotFoundError:  # pragma: no cover - exercised in environments without lmdb installed
+    _LMDB_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - exercised when lmdb is missing or broken
     lmdb = None
+    _LMDB_IMPORT_ERROR = exc
 
 
 def format_lmdb_key(index: int) -> bytes:
@@ -24,7 +26,11 @@ class TokenizedLmdbWriter:
         commit_interval: int = 1024,
     ) -> None:
         if lmdb is None:
-            raise ModuleNotFoundError("lmdb is required for the LMDB backend. Install it with `pip install lmdb`.")
+            detail = f" Original import error: {_LMDB_IMPORT_ERROR!r}" if _LMDB_IMPORT_ERROR is not None else ""
+            raise ModuleNotFoundError(
+                "lmdb is required for the LMDB backend. Install a working `lmdb` package or use the parquet backend."
+                f"{detail}"
+            )
         self.path = Path(lmdb_path)
         self.path.mkdir(parents=True, exist_ok=True)
         self.env = lmdb.open(
