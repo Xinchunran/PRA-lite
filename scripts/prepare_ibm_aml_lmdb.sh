@@ -4,6 +4,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
+DEFAULT_PRAGMA_PYTHON="${HOME}/.conda/envs/pragma-lite/bin/python"
+if [[ -x "${DEFAULT_PRAGMA_PYTHON}" ]]; then
+  PYTHON_BIN="${PYTHON_BIN:-${DEFAULT_PRAGMA_PYTHON}}"
+else
+  PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
+fi
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "Cannot resolve python interpreter. Set PYTHON_BIN explicitly." >&2
+  exit 1
+fi
 
 RAW_DIR="${RAW_DIR:-data/raw/ibm_aml}"
 RAW_CSV="${RAW_CSV:-}"
@@ -20,7 +31,7 @@ RAW_CHUNKSIZE="${RAW_CHUNKSIZE:-500000}"
 RAW_SAMPLE_FRAC="${RAW_SAMPLE_FRAC:-1.0}"
 RAW_SAMPLE_SEED="${RAW_SAMPLE_SEED:-42}"
 
-CMD=(python tools/convert_ibm_aml_to_pralite.py --raw_dir "${RAW_DIR}" --processed_dir "${PROCESSED_DIR}")
+CMD=("${PYTHON_BIN}" tools/convert_ibm_aml_to_pralite.py --raw_dir "${RAW_DIR}" --processed_dir "${PROCESSED_DIR}")
 if [[ -n "${RAW_CSV}" ]]; then
   CMD+=(--raw_csv "${RAW_CSV}")
 fi
@@ -36,21 +47,22 @@ echo "[prepare_ibm_aml] TOKENIZED_DIR=${TOKENIZED_DIR}"
 echo "[prepare_ibm_aml] RAW_CHUNKSIZE=${RAW_CHUNKSIZE}"
 echo "[prepare_ibm_aml] RAW_SAMPLE_FRAC=${RAW_SAMPLE_FRAC}"
 echo "[prepare_ibm_aml] TOKENIZE_NUM_WORKERS=${TOKENIZE_NUM_WORKERS}"
+echo "[prepare_ibm_aml] PYTHON_BIN=${PYTHON_BIN}"
 echo "[prepare_ibm_aml] stage=convert"
 "${CMD[@]}"
 
 echo "[prepare_ibm_aml] stage=split"
-python tools/make_entity_splits.py \
+"${PYTHON_BIN}" tools/make_entity_splits.py \
   --labels "${PROCESSED_DIR}/labels.parquet" \
   --out_dir "${SPLIT_DIR}"
 
 echo "[prepare_ibm_aml] stage=build_vocab"
-python -m src.tokenizer.build_vocab \
+"${PYTHON_BIN}" -m src.tokenizer.build_vocab \
   --processed_dir "${PROCESSED_DIR}" \
   --output_dir "${TOKENIZER_DIR}"
 
 echo "[prepare_ibm_aml] stage=encode"
-python -m src.tokenizer.encode_dataset \
+"${PYTHON_BIN}" -m src.tokenizer.encode_dataset \
   --processed_dir "${PROCESSED_DIR}" \
   --tokenizer_dir "${TOKENIZER_DIR}" \
   --split_dir "${SPLIT_DIR}" \
@@ -61,7 +73,7 @@ python -m src.tokenizer.encode_dataset \
   --max_profile_tokens "${MAX_PROFILE_TOKENS}" \
   --num_workers "${TOKENIZE_NUM_WORKERS}"
 
-python - <<PY
+"${PYTHON_BIN}" - <<PY
 from pathlib import Path
 import numpy as np
 

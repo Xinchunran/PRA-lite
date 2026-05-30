@@ -641,6 +641,22 @@ def main() -> None:
                 # #region debug-point B:step-timing
                 step_started_at = time.perf_counter()
                 data_wait_s = step_started_at - last_step_finished_at
+                if step < 8:
+                    entity_preview = batch["entity_id"][: min(4, batch["entity_id"].shape[0])].detach().cpu().tolist()
+                    active_token_count = int(batch["event_token_mask"].sum().item())
+                    _debug_event(
+                        "batch_loaded",
+                        hypothesis_id="A",
+                        location="src/training/pretrain_mlm.py:batch_loaded",
+                        msg="[DEBUG] batch fetched from dataloader",
+                        step=step + 1,
+                        epoch=epoch,
+                        rank=_rank(),
+                        batch_size=int(batch["entity_id"].shape[0]),
+                        entity_preview=entity_preview,
+                        active_token_count=active_token_count,
+                        data_wait_s=round(data_wait_s, 4),
+                    )
                 # #endregion
                 # #region debug-point B:h2d
                 h2d_started_at = time.perf_counter()
@@ -667,6 +683,20 @@ def main() -> None:
                 mlm_labels = batch["mlm_labels"].to(device, non_blocking=True)
                 # #region debug-point B:h2d
                 h2d_s = time.perf_counter() - h2d_started_at
+                if step < 8:
+                    _debug_event(
+                        "batch_h2d_done",
+                        hypothesis_id="A",
+                        location="src/training/pretrain_mlm.py:h2d_done",
+                        msg="[DEBUG] batch copied to device",
+                        step=step + 1,
+                        epoch=epoch,
+                        rank=_rank(),
+                        h2d_s=round(h2d_s, 4),
+                        profile_shape=list(model_inputs["profile_key_ids"].shape),
+                        event_shape=list(model_inputs["event_key_ids"].shape),
+                        label_shape=list(mlm_labels.shape),
+                    )
                 # #endregion
                 # #region debug-point B:forward
                 forward_started_at = time.perf_counter()
@@ -677,6 +707,19 @@ def main() -> None:
                 masked_correct, masked_count = _masked_accuracy_stats(logits, mlm_labels)
                 # #region debug-point B:forward
                 forward_s = time.perf_counter() - forward_started_at
+                if step < 8:
+                    _debug_event(
+                        "forward_done",
+                        hypothesis_id="B",
+                        location="src/training/pretrain_mlm.py:forward_done",
+                        msg="[DEBUG] forward completed",
+                        step=step + 1,
+                        epoch=epoch,
+                        rank=_rank(),
+                        forward_s=round(forward_s, 4),
+                        loss=float(loss.item()),
+                        masked_count=int(masked_count),
+                    )
                 # #endregion
 
                 # #region debug-point B:backward
@@ -688,6 +731,18 @@ def main() -> None:
                 grad_norm = _grad_norm(model)
                 # #region debug-point B:backward
                 backward_s = time.perf_counter() - backward_started_at
+                if step < 8:
+                    _debug_event(
+                        "backward_done",
+                        hypothesis_id="B",
+                        location="src/training/pretrain_mlm.py:backward_done",
+                        msg="[DEBUG] backward completed",
+                        step=step + 1,
+                        epoch=epoch,
+                        rank=_rank(),
+                        backward_s=round(backward_s, 4),
+                        grad_norm=round(float(grad_norm), 4),
+                    )
                 step_optimizer_started_at = time.perf_counter()
                 # #endregion
                 optimizer.step()
@@ -701,6 +756,19 @@ def main() -> None:
                 # #region debug-point B:optimizer
                 optimizer_s = time.perf_counter() - step_optimizer_started_at
                 total_step_s = time.perf_counter() - step_started_at
+                if step < 8:
+                    _debug_event(
+                        "optimizer_done",
+                        hypothesis_id="B",
+                        location="src/training/pretrain_mlm.py:optimizer_done",
+                        msg="[DEBUG] optimizer step completed",
+                        step=step + 1,
+                        epoch=epoch,
+                        rank=_rank(),
+                        optimizer_s=round(optimizer_s, 4),
+                        total_step_s=round(total_step_s, 4),
+                        next_lr=float(next_lr),
+                    )
                 if step < 5 or (step + 1) % log_every == 0:
                     active_token_count = int(batch["event_token_mask"].sum().item())
                     gpu_allocated_gb = float(torch.cuda.memory_allocated(device) / (1024**3)) if device.type == "cuda" else 0.0

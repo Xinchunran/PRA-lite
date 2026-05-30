@@ -1,13 +1,21 @@
 training:
   task: masked_language_modeling
   batch_size: 32
-  max_steps: 2000
+  max_steps: 6000
   learning_rate: 3.0e-4
+  scheduler: cosine
+  warmup_steps: 300
   weight_decay: 0.01
   seed: 42
   log_every: 100
   num_workers: 0
   pin_memory: true
+
+dataloader:
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
 
 masking:
   token_mask_prob: 0.15

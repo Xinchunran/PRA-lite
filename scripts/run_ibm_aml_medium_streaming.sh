@@ -4,7 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
+DEFAULT_PRAGMA_PYTHON="${HOME}/.conda/envs/pragma-lite/bin/python"
+if [[ -x "${DEFAULT_PRAGMA_PYTHON}" ]]; then
+  PYTHON_BIN="${PYTHON_BIN:-${DEFAULT_PRAGMA_PYTHON}}"
+else
+  PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
+fi
 
 if [[ -z "${PYTHON_BIN}" ]]; then
   echo "Cannot resolve python interpreter. Set PYTHON_BIN explicitly." >&2
@@ -114,7 +119,19 @@ summary_path = Path("${tokenized_dir}/tokenized_summary.json")
 tokenizer_path = Path("${TOKENIZER_DIR}/tokenizer.json")
 summary = json.loads(summary_path.read_text(encoding="utf-8"))
 tokenizer = json.loads(tokenizer_path.read_text(encoding="utf-8"))
-print("1" if int(summary.get("vocab_size", -1)) == len(tokenizer.get("token_to_id", {})) else "0")
+expected = {
+    "vocab_size": len(tokenizer.get("token_to_id", {})),
+    "max_events": int("${MAX_EVENTS}"),
+    "max_event_tokens": int("${MAX_EVENT_TOKENS}"),
+    "max_profile_tokens": int("${MAX_PROFILE_TOKENS}"),
+}
+actual = {
+    "vocab_size": int(summary.get("vocab_size", -1)),
+    "max_events": int(summary.get("max_events", -1)),
+    "max_event_tokens": int(summary.get("max_event_tokens", -1)),
+    "max_profile_tokens": int(summary.get("max_profile_tokens", -1)),
+}
+print("1" if actual == expected else "0")
 PY
       )"
     fi

@@ -4,6 +4,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
+DEFAULT_PRAGMA_PYTHON="${HOME}/.conda/envs/pragma-lite/bin/python"
+if [[ -x "${DEFAULT_PRAGMA_PYTHON}" ]]; then
+  PYTHON_BIN="${PYTHON_BIN:-${DEFAULT_PRAGMA_PYTHON}}"
+else
+  PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
+fi
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "Cannot resolve python interpreter. Set PYTHON_BIN explicitly." >&2
+  exit 1
+fi
 
 SHARD_SPEC="${1:-${SHARD_SPEC:-}}"
 if [[ -z "${SHARD_SPEC}" ]]; then
@@ -32,7 +43,7 @@ mkdir -p "${PROCESSED_SHARD_ROOT}" "${TOKENIZED_SHARD_ROOT}"
 resolve_shard_csv() {
   local spec="$1"
   if [[ -f "${spec}" ]]; then
-    python - <<PY
+    "${PYTHON_BIN}" - <<PY
 from pathlib import Path
 print(Path("${spec}").resolve())
 PY
@@ -61,7 +72,7 @@ append_manifest_locked() {
   : > "${lock_path}"
   exec 9>"${lock_path}"
   flock -x 9
-  python - <<PY
+  "${PYTHON_BIN}" - <<PY
 import json
 from pathlib import Path
 
@@ -112,13 +123,25 @@ echo "[prepare_shard] TOKENIZE_NUM_WORKERS=${TOKENIZE_NUM_WORKERS}"
 if [[ -f "${tokenized_dir}/dataset.lmdb/length.txt" && -f "${tokenized_dir}/train.lmdb/length.txt" && -f "${tokenized_dir}/valid.lmdb/length.txt" ]]; then
   if [[ -f "${tokenized_dir}/tokenized_summary.json" ]]; then
     reuse_ok="$(
-      python - <<PY
+      "${PYTHON_BIN}" - <<PY
 import json
 from pathlib import Path
 
 summary = json.loads(Path("${tokenized_dir}/tokenized_summary.json").read_text(encoding="utf-8"))
 tokenizer = json.loads(Path("${TOKENIZER_DIR}/tokenizer.json").read_text(encoding="utf-8"))
-print("1" if int(summary.get("vocab_size", -1)) == len(tokenizer.get("token_to_id", {})) else "0")
+expected = {
+    "vocab_size": len(tokenizer.get("token_to_id", {})),
+    "max_events": int("${MAX_EVENTS}"),
+    "max_event_tokens": int("${MAX_EVENT_TOKENS}"),
+    "max_profile_tokens": int("${MAX_PROFILE_TOKENS}"),
+}
+actual = {
+    "vocab_size": int(summary.get("vocab_size", -1)),
+    "max_events": int(summary.get("max_events", -1)),
+    "max_event_tokens": int(summary.get("max_event_tokens", -1)),
+    "max_profile_tokens": int(summary.get("max_profile_tokens", -1)),
+}
+print("1" if actual == expected else "0")
 PY
     )"
   fi
@@ -136,13 +159,13 @@ if [[ -d "${tokenized_dir}" ]]; then
 fi
 
 echo "[prepare_shard] shard=${shard_name} stage=convert"
-python tools/convert_ibm_aml_to_pralite.py \
+"${PYTHON_BIN}" tools/convert_ibm_aml_to_pralite.py \
   --raw_dir "${RAW_DIR}" \
   --raw_csv "${shard_csv}" \
   --processed_dir "${processed_dir}"
 
 echo "[prepare_shard] shard=${shard_name} stage=encode"
-python -m src.tokenizer.encode_dataset \
+"${PYTHON_BIN}" -m src.tokenizer.encode_dataset \
   --processed_dir "${processed_dir}" \
   --tokenizer_dir "${TOKENIZER_DIR}" \
   --output_dir "${tokenized_dir}" \

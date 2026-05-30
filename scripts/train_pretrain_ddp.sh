@@ -4,8 +4,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
-TORCHRUN_BIN="${TORCHRUN_BIN:-$(command -v torchrun)}"
+DEFAULT_PRAGMA_PYTHON="${HOME}/.conda/envs/pragma-lite/bin/python"
+DEFAULT_PRAGMA_TORCHRUN="${HOME}/.conda/envs/pragma-lite/bin/torchrun"
+if [[ -x "${DEFAULT_PRAGMA_PYTHON}" ]]; then
+  PYTHON_BIN="${PYTHON_BIN:-${DEFAULT_PRAGMA_PYTHON}}"
+else
+  PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
+fi
+if [[ -x "${DEFAULT_PRAGMA_TORCHRUN}" ]]; then
+  TORCHRUN_BIN="${TORCHRUN_BIN:-${DEFAULT_PRAGMA_TORCHRUN}}"
+else
+  TORCHRUN_BIN="${TORCHRUN_BIN:-$(command -v torchrun)}"
+fi
 
 if [[ -z "${PYTHON_BIN}" ]]; then
   echo "Cannot resolve python interpreter. Set PYTHON_BIN explicitly." >&2
@@ -28,6 +38,9 @@ PROCESSED_DIR="${PROCESSED_DIR:-}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 BACKEND="${BACKEND:-nccl}"
 CHECK_SPLITS="${CHECK_SPLITS:-0}"
+if [[ -z "${PRAGMA_DEBUG_ENV_FILE:-}" && -f "${PROJECT_ROOT}/.dbg/ddp-step1-hang.env" ]]; then
+  export PRAGMA_DEBUG_ENV_FILE="${PROJECT_ROOT}/.dbg/ddp-step1-hang.env"
+fi
 
 mkdir -p "${OUTPUT_DIR}"
 
