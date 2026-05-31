@@ -110,12 +110,12 @@ def _assert_split_outputs(labels_path: Path, split_dir: Path) -> None:
 def test_larger_dataset_scripts_and_config_exist() -> None:
     root = Path(__file__).resolve().parents[1]
     for relative in [
-        "scripts/download_transxion_public.sh",
-        "scripts/download_paysim.sh",
-        "scripts/download_elliptic.sh",
-        "scripts/download_hf_public_datasets.sh",
-        "scripts/download_fdb.sh",
-        "scripts/run_transxion_benchmark.sh",
+        "scripts/download/download_transxion_public.sh",
+        "scripts/download/download_paysim.sh",
+        "scripts/download/download_elliptic.sh",
+        "scripts/download/download_hf_public_datasets.sh",
+        "scripts/download/download_fdb.sh",
+        "scripts/benchmarks/run_transxion_benchmark.sh",
         "configs/data/transxion_public.yaml",
         "configs/data/transxion_full.yaml",
         "configs/train/pretrain_mlm_mini.yaml",

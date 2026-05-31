@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || { cd "${SCRIPT_DIR}/.." && pwd; })"
 cd "${PROJECT_ROOT}"
 
 ACTION="${1:-help}"
@@ -23,7 +23,7 @@ MINI_TARGET_EVENTS="${MINI_TARGET_EVENTS:-200000}"
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/run_transxion_benchmark.sh <action> <scale>
+  bash scripts/benchmarks/run_transxion_benchmark.sh <action> <scale>
 
 Actions:
   download   Download TransXion public raw files only
@@ -37,9 +37,9 @@ Scales:
   both       run mini then small
 
 Examples:
-  bash scripts/run_transxion_benchmark.sh prepare mini
-  NPROC_PER_NODE=2 bash scripts/run_transxion_benchmark.sh train small
-  NPROC_PER_NODE=2 bash scripts/run_transxion_benchmark.sh all both
+  bash scripts/benchmarks/run_transxion_benchmark.sh prepare mini
+  NPROC_PER_NODE=2 bash scripts/benchmarks/run_transxion_benchmark.sh train small
+  NPROC_PER_NODE=2 bash scripts/benchmarks/run_transxion_benchmark.sh all both
 
 Important:
   - This script never downloads data unless action=download.
@@ -141,7 +141,7 @@ train_scale() {
   NPROC_PER_NODE="${NPROC_PER_NODE}" \
   BACKEND="${BACKEND}" \
   CHECK_SPLITS="${CHECK_SPLITS}" \
-  bash scripts/train_pretrain_ddp.sh
+  bash scripts/train/train_pretrain_ddp.sh
 }
 
 run_prepare() {
@@ -179,7 +179,7 @@ case "${ACTION}" in
     usage
     ;;
   download)
-    bash scripts/download_transxion_public.sh
+    bash scripts/download/download_transxion_public.sh
     ;;
   prepare)
     run_prepare

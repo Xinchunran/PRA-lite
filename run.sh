@@ -344,7 +344,7 @@ if [[ "${DO_TRAIN}" == "1" ]]; then
   PROCESSED_DIR="${PROCESSED_DIR}" \
   OUTPUT_DIR="${OUTPUT_DIR}" \
   CHECK_SPLITS=1 \
-  bash scripts/train_pretrain_ddp.sh 2>&1 | tee -a "${TRAIN_LOG}"
+  bash scripts/train/train_pretrain_ddp.sh 2>&1 | tee -a "${TRAIN_LOG}"
 else
   echo "[$(date)] DO_TRAIN=0, prepare only; skipping pretraining launch" 2>&1 | tee -a "${PREP_LOG}"
 fi

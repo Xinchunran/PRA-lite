@@ -12,7 +12,8 @@
 
 set -eo pipefail
 
-PROJECT_ROOT="${SLURM_SUBMIT_DIR:-/home/ranx/PRA-lite}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || printf '%s' "${SLURM_SUBMIT_DIR:-/home/ranx/PRA-lite}")"
 cd "${PROJECT_ROOT}"
 mkdir -p "${PROJECT_ROOT}/logs"
 
@@ -25,4 +26,4 @@ export WORK_ROOT="${WORK_ROOT:-data/streaming/ibm_aml_li_medium_pragma_lite_full
 export RAW_DIR="${RAW_DIR:-data/raw/ibm_aml}"
 export RAW_CSV="${RAW_CSV:-LI-Medium_Trans.csv}"
 
-bash "${PROJECT_ROOT}/scripts/prepare_ibm_aml_li_pragma_lite_full.sh"
+bash "${PROJECT_ROOT}/scripts/prepare/pragma_c/prepare_ibm_aml_li_pragma_lite_full.sh"

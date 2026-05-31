@@ -36,9 +36,9 @@ This table compares the original [PRAGMA paper (arXiv:2604.08649)](https://arxiv
 - `src/inference/predict.py`: batch prediction
 - `src/inference/extract_embeddings.py`: embedding export
 - `src/training/linear_probe.py`: frozen linear probe
-- `scripts/run_lite_benchmark.py`: reproducible evaluation benchmark
-- `scripts/run_transxion_benchmark.sh`: public TransXion prepare/train entry point
-- `scripts/run_ibm_aml_medium_streaming.sh`: IBM AML medium streaming prepare + train entry point
+- `scripts/benchmarks/run_lite_benchmark.py`: reproducible evaluation benchmark
+- `scripts/benchmarks/run_transxion_benchmark.sh`: public TransXion prepare/train entry point
+- `scripts/train/run_ibm_aml_medium_streaming.sh`: IBM AML medium streaming prepare + train entry point
 
 ## Install
 
@@ -101,7 +101,7 @@ This benchmark evaluates `zh_usr`, `last_evt`, `concat`, and `record`, then writ
 Use the unified shell entry point:
 
 ```bash
-bash scripts/run_transxion_benchmark.sh <action> <scale>
+bash scripts/benchmarks/run_transxion_benchmark.sh <action> <scale>
 ```
 
 Supported actions:
@@ -119,9 +119,9 @@ Supported scales:
 Examples:
 
 ```bash
-bash scripts/run_transxion_benchmark.sh prepare mini
-bash scripts/run_transxion_benchmark.sh prepare small
-NPROC_PER_NODE=2 bash scripts/run_transxion_benchmark.sh train small
+bash scripts/benchmarks/run_transxion_benchmark.sh prepare mini
+bash scripts/benchmarks/run_transxion_benchmark.sh prepare small
+NPROC_PER_NODE=2 bash scripts/benchmarks/run_transxion_benchmark.sh train small
 ```
 
 ## IBM AML
@@ -131,29 +131,29 @@ Download the Kaggle files:
 ```bash
 conda activate pragma-lite
 
-KAGGLE_FILE=LI-Small_Trans.csv bash scripts/download_ibm_aml_kaggle.sh
-KAGGLE_FILE=LI-Small_accounts.csv bash scripts/download_ibm_aml_kaggle.sh
-KAGGLE_FILE=LI-Medium_Trans.csv bash scripts/download_ibm_aml_kaggle.sh
-KAGGLE_FILE=LI-Medium_accounts.csv bash scripts/download_ibm_aml_kaggle.sh
+KAGGLE_FILE=LI-Small_Trans.csv bash scripts/download/download_ibm_aml_kaggle.sh
+KAGGLE_FILE=LI-Small_accounts.csv bash scripts/download/download_ibm_aml_kaggle.sh
+KAGGLE_FILE=LI-Medium_Trans.csv bash scripts/download/download_ibm_aml_kaggle.sh
+KAGGLE_FILE=LI-Medium_accounts.csv bash scripts/download/download_ibm_aml_kaggle.sh
 ```
 
 Prepare a static LMDB dataset:
 
 ```bash
-RAW_CSV=LI-Small_Trans.csv bash scripts/prepare_ibm_aml_lmdb.sh
+RAW_CSV=LI-Small_Trans.csv bash scripts/prepare/streaming/prepare_ibm_aml_lmdb.sh
 ```
 
 Train on IBM AML:
 
 ```bash
-TRAIN_BATCH_SIZE=16 bash scripts/train_ibm_aml_lmdb.sh
+TRAIN_BATCH_SIZE=16 bash scripts/train/train_ibm_aml_lmdb.sh
 ```
 
 For medium-scale streaming prepare + train:
 
 ```bash
 conda activate pragma-lite
-bash scripts/run_ibm_aml_medium_streaming.sh
+bash scripts/train/run_ibm_aml_medium_streaming.sh
 ```
 
 Useful overrides:
@@ -164,7 +164,7 @@ TRAIN_BATCH_SIZE=16 \
 NPROC_PER_NODE=4 \
 PRECISION=bf16 \
 TOKENIZE_NUM_WORKERS=8 \
-bash scripts/run_ibm_aml_medium_streaming.sh
+bash scripts/train/run_ibm_aml_medium_streaming.sh
 ```
 
 ### Split Protocols
@@ -179,13 +179,13 @@ IBM AML experiments now keep two split protocols in parallel:
 The legacy random/hash split entry point remains:
 
 ```bash
-bash scripts/run_ibm_aml_medium_streaming.sh
+bash scripts/train/run_ibm_aml_medium_streaming.sh
 ```
 
 The leakage-prevent path uses a separate data root, tokenizer, manifest, logs, plots, and checkpoints:
 
 ```bash
-bash scripts/prepare_ibm_aml_li_pragma_lite_full.sh
+bash scripts/prepare/pragma_c/prepare_ibm_aml_li_pragma_lite_full.sh
 ```
 
 Legacy `pragma_c` scripts are still kept in the repo for reference, but the current leakage-prevent preprocessing path is rooted at `pragma_lite_full`.
@@ -193,7 +193,7 @@ Legacy `pragma_c` scripts are still kept in the repo for reference, but the curr
 The Stage C train entry point defaults to `MAX_EVENTS=256` and `split_mode=pragma_c`. You can still fall back to the legacy split logic without changing training code:
 
 ```bash
-SPLIT_MODE=random bash scripts/run_ibm_aml_li_medium_pragma_c_pretrain.sh
+SPLIT_MODE=random bash scripts/train/run_ibm_aml_li_medium_pragma_c_pretrain.sh
 ```
 
 When the current leakage-prevent preprocessing path is launched, processed data is written to:

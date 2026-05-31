@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || { cd "${SCRIPT_DIR}/.." && pwd; })"
 cd "${PROJECT_ROOT}"
 DEFAULT_PRAGMA_PYTHON="${HOME}/.conda/envs/pragma-lite/bin/python"
 if [[ -x "${DEFAULT_PRAGMA_PYTHON}" ]]; then
@@ -227,7 +227,7 @@ echo "[streaming_run] stage=train"
 echo "[streaming_run] TRAIN_LOG=${TRAIN_LOG}"
 echo "[streaming_run] PLOTS_DIR=${PLOTS_DIR}"
 set +e
-CHECK_SPLITS=0 bash scripts/train_pretrain_ddp.sh 2>&1 | tee -a "${TRAIN_LOG}"
+CHECK_SPLITS=0 bash scripts/train/train_pretrain_ddp.sh 2>&1 | tee -a "${TRAIN_LOG}"
 TRAIN_EXIT_CODE=$?
 set -e
 

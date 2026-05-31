@@ -13,7 +13,8 @@
 
 set -eo pipefail
 
-PROJECT_ROOT="${SLURM_SUBMIT_DIR:-/home/ranx/PRA-lite}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || printf '%s' "${SLURM_SUBMIT_DIR:-/home/ranx/PRA-lite}")"
 cd "${PROJECT_ROOT}"
 
 mkdir -p "${PROJECT_ROOT}/logs"
@@ -51,4 +52,4 @@ echo "[$(date)] cpus=${SLURM_CPUS_PER_TASK:-unknown} mem=${SLURM_MEM_PER_NODE:-u
 echo "[$(date)] tokenizer=${TOKENIZER_DIR}"
 echo "[$(date)] manifest=${MANIFEST_PATH}"
 
-bash "${PROJECT_ROOT}/scripts/prepare_ibm_aml_medium_streaming_shard.sh" "${SHARD_NAME}"
+bash "${PROJECT_ROOT}/scripts/prepare/streaming/prepare_ibm_aml_medium_streaming_shard.sh" "${SHARD_NAME}"

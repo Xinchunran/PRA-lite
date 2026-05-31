@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || { cd "${SCRIPT_DIR}/.." && pwd; })"
 cd "${PROJECT_ROOT}"
 
 DEFAULT_PRAGMA_PYTHON="${HOME}/.conda/envs/pragma-lite/bin/python"
@@ -32,7 +32,7 @@ INACTIVITY_PROFILE_COL="${INACTIVITY_PROFILE_COL:-seconds_since_last_event}"
 MANIFEST_LOCK="${WORK_ROOT}/.manifest.lock"
 
 echo "[pragma_c_encode_wrapper] shard=${SHARD_INDEX} stage=encode start" >&2
-"${PYTHON_BIN}" scripts/encode_pragma_c_records.py \
+"${PYTHON_BIN}" scripts/prepare/pragma_c/encode_pragma_c_records.py \
   --output_root "${WORK_ROOT}" \
   --shard_index "${SHARD_INDEX}" \
   --num_shards "${NUM_SHARDS}" \
@@ -50,7 +50,7 @@ echo "[pragma_c_encode_wrapper] shard=${SHARD_INDEX} stage=manifest start" >&2
 mkdir -p "$(dirname "${MANIFEST_LOCK}")"
 (
   flock 9
-  "${PYTHON_BIN}" scripts/build_pragma_c_manifest.py \
+  "${PYTHON_BIN}" scripts/prepare/pragma_c/build_pragma_c_manifest.py \
     --output_root "${WORK_ROOT}"
 ) 9>"${MANIFEST_LOCK}"
 echo "[pragma_c_encode_wrapper] shard=${SHARD_INDEX} stage=done" >&2

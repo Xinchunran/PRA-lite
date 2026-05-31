@@ -14,7 +14,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || { cd "${SCRIPT_DIR}/.." && pwd; })"
 cd "${PROJECT_ROOT}"
 
 source ~/.bashrc
@@ -103,4 +103,4 @@ TOKENIZER_DIR="${TOKENIZER_DIR}" \
 PROCESSED_DIR="${PROCESSED_DIR}" \
 OUTPUT_DIR="${OUTPUT_DIR}" \
 CHECK_SPLITS=1 \
-bash scripts/train_pretrain_ddp.sh 2>&1 | tee -a "${TRAIN_LOG}"
+bash scripts/train/train_pretrain_ddp.sh 2>&1 | tee -a "${TRAIN_LOG}"

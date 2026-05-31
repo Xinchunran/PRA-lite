@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || { cd "${SCRIPT_DIR}/.." && pwd; })"
 cd "${PROJECT_ROOT}"
 
 DEFAULT_PRAGMA_PYTHON="${HOME}/.conda/envs/pragma-lite/bin/python"
@@ -27,18 +27,18 @@ INACTIVITY_PROFILE_COL="${INACTIVITY_PROFILE_COL:-seconds_since_last_event}"
 
 mkdir -p "${WORK_ROOT}"
 
-"${PYTHON_BIN}" scripts/build_pragma_c_canonical_transactions.py \
+"${PYTHON_BIN}" scripts/prepare/pragma_c/build_pragma_c_canonical_transactions.py \
   --raw_dir "${RAW_DIR}" \
   --raw_csv "${RAW_CSV}" \
   --output_root "${WORK_ROOT}"
 
-"${PYTHON_BIN}" scripts/build_pragma_c_eval_points.py \
+"${PYTHON_BIN}" scripts/prepare/pragma_c/build_pragma_c_eval_points.py \
   --output_root "${WORK_ROOT}"
 
-"${PYTHON_BIN}" scripts/assign_pragma_c_splits.py \
+"${PYTHON_BIN}" scripts/prepare/pragma_c/assign_pragma_c_splits.py \
   --output_root "${WORK_ROOT}"
 
-"${PYTHON_BIN}" scripts/build_pragma_c_tokenizer.py \
+"${PYTHON_BIN}" scripts/prepare/pragma_c/build_pragma_c_tokenizer.py \
   --output_root "${WORK_ROOT}" \
   --max_history_events "${MAX_HISTORY_EVENTS}" \
   --profile_sample_limit "${PROFILE_SAMPLE_LIMIT}" \
@@ -46,13 +46,13 @@ mkdir -p "${WORK_ROOT}"
   --history_time_anchor "${HISTORY_TIME_ANCHOR}" \
   --inactivity_profile_col "${INACTIVITY_PROFILE_COL}"
 
-"${PYTHON_BIN}" scripts/audit_pragma_c_leakage.py \
+"${PYTHON_BIN}" scripts/prepare/pragma_c/audit_pragma_c_leakage.py \
   --output_root "${WORK_ROOT}"
 
-"${PYTHON_BIN}" scripts/audit_pragma_c_graph.py \
+"${PYTHON_BIN}" scripts/prepare/pragma_c/audit_pragma_c_graph.py \
   --output_root "${WORK_ROOT}"
 
-"${PYTHON_BIN}" scripts/build_pragma_c_encode_index.py \
+"${PYTHON_BIN}" scripts/prepare/pragma_c/build_pragma_c_encode_index.py \
   --output_root "${WORK_ROOT}" \
   --num_shards "${NUM_SHARDS}" \
   --max_eval_points_per_account_train "${MAX_EVAL_POINTS_PER_ACCOUNT_TRAIN}" \

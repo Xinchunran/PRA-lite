@@ -128,7 +128,7 @@ if dataset in ("elliptic", "all"):
     download_elliptic()
 
 if dataset not in ("paysim", "elliptic", "all"):
-    raise SystemExit("Usage: bash scripts/download_hf_public_datasets.sh [all|paysim|elliptic]")
+    raise SystemExit("Usage: bash scripts/download/download_hf_public_datasets.sh [all|paysim|elliptic]")
 PY
 
 echo

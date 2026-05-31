@@ -609,6 +609,20 @@ def main() -> None:
 
     train_cfg = load_yaml(args.config)
     model_cfg = load_yaml(args.model_config)["model"]
+    # #region debug-point A:model-config-load
+    _debug_event(
+        "model_config_loaded",
+        hypothesis_id="A",
+        location="src/training/pretrain_mlm.py:model_config_loaded",
+        msg="[DEBUG] model config loaded",
+        model_config_path=str(args.model_config),
+        model_cfg_keys=sorted(str(key) for key in model_cfg.keys()),
+        has_max_events="max_events" in model_cfg,
+        has_max_event_tokens="max_event_tokens" in model_cfg,
+        env_model_config=os.environ.get("MODEL_CONFIG"),
+        env_max_events=os.environ.get("MAX_EVENTS"),
+    )
+    # #endregion
     data_dir = Path(args.data_dir)
     split_dir = Path(args.split_dir)
     manifest_path = Path(args.manifest_path) if args.manifest_path else None
@@ -654,6 +668,19 @@ def main() -> None:
         use_additive_time_proj=bool(model_cfg.get("use_additive_time_proj", True)),
         use_history_order_emb=bool(model_cfg.get("use_history_order_emb", True)),
     )
+    # #region debug-point B:model-config-resolved
+    _debug_event(
+        "model_config_resolved",
+        hypothesis_id="B",
+        location="src/training/pretrain_mlm.py:model_config_resolved",
+        msg="[DEBUG] model config resolved into PragmaLiteConfig",
+        cfg_max_events=int(cfg.max_events),
+        cfg_max_event_tokens=int(cfg.max_event_tokens),
+        cfg_max_profile_tokens=int(cfg.max_profile_tokens),
+    )
+    # #endregion
+    resolved_max_events = int(cfg.max_events)
+    resolved_max_event_tokens = int(cfg.max_event_tokens)
     if manifest_path is None:
         _require_lmdb_for_full_scale(data_dir)
     # #region debug-point A:dataset-init
@@ -719,6 +746,19 @@ def main() -> None:
         unk_probability=float(masking_cfg.get("unk_prob", 0.10)),
         seed=seed + 1,
     )
+    # #region debug-point C:dataloader-arg-check
+    _debug_event(
+        "dataloader_arg_check",
+        hypothesis_id="C",
+        location="src/training/pretrain_mlm.py:dataloader_arg_check",
+        msg="[DEBUG] dataloader args about to be materialized from raw model_cfg",
+        raw_model_cfg_keys=sorted(str(key) for key in model_cfg.keys()),
+        raw_has_max_events="max_events" in model_cfg,
+        raw_has_max_event_tokens="max_event_tokens" in model_cfg,
+        resolved_cfg_max_events=resolved_max_events,
+        resolved_cfg_max_event_tokens=resolved_max_event_tokens,
+    )
+    # #endregion
     (
         train_ds,
         valid_ds,
@@ -733,8 +773,8 @@ def main() -> None:
         train_split_name=train_split_name,
         valid_split_name=valid_split_name,
         batch_size=batch_size,
-        max_events=int(model_cfg["max_events"]),
-        max_event_tokens=int(model_cfg["max_event_tokens"]),
+        max_events=resolved_max_events,
+        max_event_tokens=resolved_max_event_tokens,
         seed=seed,
         dataloader_cfg=dataloader_cfg,
         train_collator=train_collator,
@@ -839,8 +879,8 @@ def main() -> None:
                     train_split_name=train_split_name,
                     valid_split_name=valid_split_name,
                     batch_size=batch_size,
-                    max_events=int(model_cfg["max_events"]),
-                    max_event_tokens=int(model_cfg["max_event_tokens"]),
+                    max_events=resolved_max_events,
+                    max_event_tokens=resolved_max_event_tokens,
                     seed=seed,
                     dataloader_cfg=dataloader_cfg,
                     train_collator=train_collator,

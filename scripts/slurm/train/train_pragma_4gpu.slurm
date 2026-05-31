@@ -29,4 +29,4 @@ DATA_DIR=runs/smoke_test/data/processed/transxion/tokenized \
 SPLIT_DIR=runs/smoke_test/data/splits/transxion \
 TOKENIZER_DIR=runs/smoke_test/data/processed/transxion/tokenizer \
 OUTPUT_DIR=runs/pretrain_ddp_4gpu_smoke \
-bash scripts/train_pretrain_ddp.sh
+bash scripts/train/train_pretrain_ddp.sh

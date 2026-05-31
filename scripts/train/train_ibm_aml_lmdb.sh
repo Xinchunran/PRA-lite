@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || { cd "${SCRIPT_DIR}/.." && pwd; })"
 cd "${PROJECT_ROOT}"
 
 export CONFIG="${CONFIG:-configs/train/pretrain_mlm_small.yaml}"
@@ -27,4 +27,4 @@ if [[ ! -d "${DATA_DIR}/dataset.lmdb" ]]; then
   exit 1
 fi
 
-CHECK_SPLITS=1 bash scripts/train_pretrain_ddp.sh
+CHECK_SPLITS=1 bash scripts/train/train_pretrain_ddp.sh
