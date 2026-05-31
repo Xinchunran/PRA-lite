@@ -25,6 +25,10 @@ dataloader:
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
+  dynamic_batching: true
+  token_budget: 32768
+  max_batch_size: 16
+  event_bucket_boundaries: [8, 16, 32, 64, 128, 256]
 
 masking:
   token_mask_prob: 0.15

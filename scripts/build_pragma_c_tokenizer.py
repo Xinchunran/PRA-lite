@@ -11,6 +11,7 @@ import pandas as pd
 from src.common.fs import ensure_dir, write_json
 from src.pragma_c.common import EVENT_COLS, PROFILE_COLS, build_account_event_view, compute_profile_state, history_before
 from src.tokenizer.schema import FieldSchema, VocabBuildConfig
+from src.tokenizer.structured import _collect_valid_event_rows
 from src.tokenizer.text_bpe import train_text_tokenizer
 from src.tokenizer.vocab import NumericBinner, SPECIAL_TOKENS, TokenizerVocab
 
@@ -52,11 +53,14 @@ def build_tokenizer(
     min_freq: int = 5,
     profile_sample_limit: int = 200000,
     max_history_events: int = 6500,
+    max_events: int = 256,
     seed: int = 42,
     categorical_threshold: int = 2048,
     max_text_vocab_size: int = 28000,
     max_value_tokens_per_field: int = 4,
     numeric_zero_bucket: bool = True,
+    history_time_anchor: str = "last_event",
+    inactivity_profile_col: str = "seconds_since_last_event",
 ) -> Path:
     output_root = Path(output_root)
     tokenizer_dir = ensure_dir(output_root / "tokenizer")
@@ -87,15 +91,28 @@ def build_tokenizer(
     event_fit_df = account_events[account_events["timestamp"] < train_end][EVENT_COLS].copy()
 
     event_groups = {int(entity_id): df.reset_index(drop=True) for entity_id, df in account_events.groupby("entity_id", sort=False)}
-    profile_rows: list[dict[str, object]] = []
+    profile_cols = list(PROFILE_COLS)
+    if history_time_anchor == "decoupled" and inactivity_profile_col not in profile_cols:
+        profile_cols.append(inactivity_profile_col)
+
+    profile_rows = []
     for row in train_eval.itertuples(index=False):
         entity_events = event_groups.get(int(row.entity_id))
         if entity_events is None:
-            profile_rows.append(compute_profile_state(entity_events if entity_events is not None else pd.DataFrame(), row.evaluation_time))
-            continue
-        history = history_before(entity_events, row.evaluation_time, max_history_events=max_history_events)
-        profile_rows.append(compute_profile_state(history, row.evaluation_time))
-    profile_fit_df = pd.DataFrame(profile_rows, columns=PROFILE_COLS)
+            history = pd.DataFrame()
+        else:
+            history = history_before(entity_events, row.evaluation_time, max_history_events=max_history_events)
+        profile_state = compute_profile_state(history, row.evaluation_time)
+        if history_time_anchor == "decoupled":
+            included_rows = _collect_valid_event_rows(history, max_events=max_events)
+            if included_rows:
+                last_event_ts = max(ts for _, ts in included_rows)
+                inactivity_gap_seconds = max(0.0, (row.evaluation_time - last_event_ts).total_seconds())
+            else:
+                inactivity_gap_seconds = 0.0
+            profile_state[inactivity_profile_col] = float(inactivity_gap_seconds)
+        profile_rows.append(profile_state)
+    profile_fit_df = pd.DataFrame(profile_rows, columns=profile_cols)
 
     token_to_id: dict[str, int] = {token: idx for idx, token in enumerate(SPECIAL_TOKENS)}
     next_id = len(token_to_id)
@@ -111,14 +128,14 @@ def build_tokenizer(
             next_id += 1
 
     field_schemas: list[FieldSchema] = []
-    for col in PROFILE_COLS:
+    for col in profile_cols:
         field_schemas.append(_infer_field_schema("P", col, profile_fit_df[col], build_cfg))
     for col in EVENT_COLS:
         field_schemas.append(_infer_field_schema("E", col, event_fit_df[col], build_cfg))
 
     schema_map = {(schema.namespace, schema.name): schema for schema in field_schemas}
 
-    for col in PROFILE_COLS:
+    for col in profile_cols:
         add_token(f"K:P:{col}")
         schema = schema_map[("P", col)]
         field_key = f"P:{col}"
@@ -196,7 +213,7 @@ def build_tokenizer(
 
     vocab = TokenizerVocab(
         token_to_id=token_to_id,
-        profile_cols=list(PROFILE_COLS),
+        profile_cols=profile_cols,
         event_cols=list(EVENT_COLS),
         numeric_binners=numeric_binners,
         field_value_types=field_value_types,
@@ -214,6 +231,7 @@ def build_tokenizer(
             "fit_split": "train",
             "profile_sample_limit": int(profile_sample_limit),
             "max_history_events": int(max_history_events),
+            "max_events": int(max_events),
             "num_buckets": int(num_buckets),
             "min_freq": int(min_freq),
             "seed": int(seed),
@@ -221,17 +239,20 @@ def build_tokenizer(
             "max_text_vocab_size": int(max_text_vocab_size),
             "max_value_tokens_per_field": int(max_value_tokens_per_field),
             "numeric_zero_bucket": bool(numeric_zero_bucket),
+            "history_time_anchor": history_time_anchor,
+            "inactivity_profile_col": inactivity_profile_col,
         },
     )
     write_json(
         tokenizer_dir / "vocab_summary.json",
         {
             "vocab_size": len(token_to_id),
-            "profile_cols": list(PROFILE_COLS),
+            "profile_cols": profile_cols,
             "event_cols": list(EVENT_COLS),
             "tokenizer_version": 2,
             "field_value_type_counts": dict(Counter(field_value_types.values())),
             "max_value_tokens_per_field": int(max_value_tokens_per_field),
+            "history_time_anchor": history_time_anchor,
         },
     )
     return tokenizer_dir
@@ -244,11 +265,14 @@ def main() -> None:
     parser.add_argument("--min_freq", type=int, default=5)
     parser.add_argument("--profile_sample_limit", type=int, default=200000)
     parser.add_argument("--max_history_events", type=int, default=6500)
+    parser.add_argument("--max_events", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--categorical_threshold", type=int, default=2048)
     parser.add_argument("--max_text_vocab_size", type=int, default=28000)
     parser.add_argument("--max_value_tokens_per_field", type=int, default=4)
     parser.add_argument("--numeric_zero_bucket", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--history_time_anchor", choices=("evaluation", "last_event", "decoupled"), default="last_event")
+    parser.add_argument("--inactivity_profile_col", default="seconds_since_last_event")
     args = parser.parse_args()
     build_tokenizer(
         args.output_root,
@@ -256,11 +280,14 @@ def main() -> None:
         min_freq=args.min_freq,
         profile_sample_limit=args.profile_sample_limit,
         max_history_events=args.max_history_events,
+        max_events=args.max_events,
         seed=args.seed,
         categorical_threshold=args.categorical_threshold,
         max_text_vocab_size=args.max_text_vocab_size,
         max_value_tokens_per_field=args.max_value_tokens_per_field,
         numeric_zero_bucket=bool(args.numeric_zero_bucket),
+        history_time_anchor=args.history_time_anchor,
+        inactivity_profile_col=args.inactivity_profile_col,
     )
 
 

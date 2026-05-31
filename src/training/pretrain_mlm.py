@@ -23,7 +23,12 @@ from src.model.pragma_lite.model import PragmaLiteConfig, PragmaLiteModel
 from src.tokenizer.masking import MaskedEventCollator
 from src.tokenizer.vocab import TokenizerVocab
 from src.training.checkpoint import load_checkpoint, save_checkpoint
-from src.training.data import load_tokenized_manifest_split, load_tokenized_split, set_seed
+from src.training.data import (
+    DistributedTokenBudgetBatchSampler,
+    load_tokenized_manifest_split,
+    load_tokenized_split,
+    set_seed,
+)
 
 
 def _guess_tokenizer_dir(data_dir: Path) -> Path:
@@ -165,11 +170,24 @@ def _resolve_dataloader_cfg(train_cfg: dict[str, object]) -> dict[str, object]:
     persistent_workers = _env_bool("DATALOADER_PERSISTENT_WORKERS", bool(dataloader_cfg.get("persistent_workers", num_workers > 0)))
     prefetch_factor_raw = os.environ.get("DATALOADER_PREFETCH_FACTOR", dataloader_cfg.get("prefetch_factor"))
     prefetch_factor = int(prefetch_factor_raw) if prefetch_factor_raw is not None else None
+    dynamic_batching = _env_bool("DATALOADER_DYNAMIC_BATCHING", bool(dataloader_cfg.get("dynamic_batching", False)))
+    token_budget = _env_int("DATALOADER_TOKEN_BUDGET", int(dataloader_cfg.get("token_budget", 0)))
+    max_batch_size = _env_int("DATALOADER_MAX_BATCH_SIZE", int(dataloader_cfg.get("max_batch_size", 0)))
+    bucket_boundaries_raw = os.environ.get("DATALOADER_EVENT_BUCKETS")
+    if bucket_boundaries_raw is None:
+        bucket_boundaries_value = dataloader_cfg.get("event_bucket_boundaries", [8, 16, 32, 64, 128, 256])
+        bucket_boundaries = [int(x) for x in bucket_boundaries_value] if isinstance(bucket_boundaries_value, list) else [8, 16, 32, 64, 128, 256]
+    else:
+        bucket_boundaries = [int(x.strip()) for x in bucket_boundaries_raw.split(",") if x.strip()]
     return {
         "num_workers": num_workers,
         "pin_memory": pin_memory,
         "persistent_workers": persistent_workers if num_workers > 0 else False,
         "prefetch_factor": prefetch_factor if num_workers > 0 else None,
+        "dynamic_batching": dynamic_batching and token_budget > 0,
+        "token_budget": token_budget,
+        "max_batch_size": max_batch_size,
+        "event_bucket_boundaries": bucket_boundaries,
     }
 
 
@@ -235,11 +253,13 @@ def _build_data_loaders(
     train_split_name: str,
     valid_split_name: str,
     batch_size: int,
+    max_events: int,
+    max_event_tokens: int,
     seed: int,
     dataloader_cfg: dict[str, object],
     train_collator: MaskedEventCollator,
     valid_collator: MaskedEventCollator,
-) -> tuple[object, object, DataLoader, DataLoader, DistributedSampler | None, DistributedSampler | None]:
+) -> tuple[object, object, DataLoader, DataLoader, object | None, object | None]:
     if manifest_path is not None:
         train_ds = load_tokenized_manifest_split(manifest_path, train_split_name)
         valid_ds = load_tokenized_manifest_split(manifest_path, valid_split_name)
@@ -253,20 +273,44 @@ def _build_data_loaders(
     prefetch_factor = dataloader_cfg["prefetch_factor"]
     train_sampler = None
     valid_sampler = None
-    if _is_distributed():
+    dynamic_batching = bool(dataloader_cfg.get("dynamic_batching", False))
+    token_budget = int(dataloader_cfg.get("token_budget", 0))
+    max_batch_size = int(dataloader_cfg.get("max_batch_size", batch_size) or batch_size)
+    event_bucket_boundaries = dataloader_cfg.get("event_bucket_boundaries", [8, 16, 32, 64, 128, 256])
+    if dynamic_batching and token_budget > 0:
+        train_sampler = DistributedTokenBudgetBatchSampler(
+            train_ds,
+            token_budget=token_budget,
+            max_event_tokens=max_event_tokens,
+            max_batch_size=max_batch_size,
+            bucket_boundaries=event_bucket_boundaries if isinstance(event_bucket_boundaries, list) else [8, 16, 32, 64, 128, 256],
+            shuffle=True,
+            seed=seed,
+        )
+    elif _is_distributed():
         train_sampler = DistributedSampler(train_ds, shuffle=True, seed=seed)
+    if _is_distributed():
         valid_sampler = DistributedSampler(valid_ds, shuffle=False, seed=seed)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        collate_fn=train_collator,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
-    )
+    train_loader_kwargs = {
+        "dataset": train_ds,
+        "collate_fn": train_collator,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+        "prefetch_factor": prefetch_factor,
+    }
+    if dynamic_batching and token_budget > 0:
+        train_loader = DataLoader(
+            batch_sampler=train_sampler,
+            **train_loader_kwargs,
+        )
+    else:
+        train_loader = DataLoader(
+            batch_size=batch_size,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            **train_loader_kwargs,
+        )
     valid_loader = DataLoader(
         valid_ds,
         batch_size=batch_size,
@@ -521,7 +565,7 @@ def _evaluate(
                 continue
             with _autocast_context(device, precision):
                 logits = model(**model_inputs, return_mlm_logits=True)
-                loss = loss_fn(logits.view(-1, logits.size(-1)), mlm_labels.view(-1))
+                loss = loss_fn(logits.reshape(-1, logits.size(-1)), mlm_labels.reshape(-1))
             total_loss += float(loss.item())
             total_batches += 1
             masked_correct, masked_count = _masked_accuracy_stats(logits, mlm_labels)
@@ -607,6 +651,8 @@ def main() -> None:
             else None
         ),
         tie_mlm_to_embedding=bool(model_cfg.get("tie_mlm_to_embedding", True)),
+        use_additive_time_proj=bool(model_cfg.get("use_additive_time_proj", True)),
+        use_history_order_emb=bool(model_cfg.get("use_history_order_emb", True)),
     )
     if manifest_path is None:
         _require_lmdb_for_full_scale(data_dir)
@@ -687,6 +733,8 @@ def main() -> None:
         train_split_name=train_split_name,
         valid_split_name=valid_split_name,
         batch_size=batch_size,
+        max_events=int(model_cfg["max_events"]),
+        max_event_tokens=int(model_cfg["max_event_tokens"]),
         seed=seed,
         dataloader_cfg=dataloader_cfg,
         train_collator=train_collator,
@@ -722,10 +770,14 @@ def main() -> None:
         location="src/training/pretrain_mlm.py:232",
         msg="[DEBUG] dataloader configured",
         batch_size=batch_size,
+        dynamic_batching=bool(dataloader_cfg.get("dynamic_batching", False)),
+        token_budget=int(dataloader_cfg.get("token_budget", 0)),
+        max_batch_size=int(dataloader_cfg.get("max_batch_size", batch_size) or batch_size),
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+        event_bucket_boundaries=dataloader_cfg.get("event_bucket_boundaries", [8, 16, 32, 64, 128, 256]),
         enable_tf32=_env_bool("ENABLE_TF32", True),
         world_size=int(os.environ.get("WORLD_SIZE", "1")),
         precision=precision,
@@ -787,6 +839,8 @@ def main() -> None:
                     train_split_name=train_split_name,
                     valid_split_name=valid_split_name,
                     batch_size=batch_size,
+                    max_events=int(model_cfg["max_events"]),
+                    max_event_tokens=int(model_cfg["max_event_tokens"]),
                     seed=seed,
                     dataloader_cfg=dataloader_cfg,
                     train_collator=train_collator,
@@ -883,7 +937,7 @@ def main() -> None:
                 with _autocast_context(device, precision):
                     logits = model(**model_inputs, return_mlm_logits=True)
                     if has_targets_local:
-                        loss = loss_fn(logits.view(-1, logits.size(-1)), mlm_labels.view(-1))
+                        loss = loss_fn(logits.reshape(-1, logits.size(-1)), mlm_labels.reshape(-1))
                     else:
                         # Keep all ranks on the same DDP execution path when only a subset
                         # of local batches contains masked MLM targets.

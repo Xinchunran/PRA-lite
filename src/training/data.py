@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 from bisect import bisect_right
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import pickle
 import time
-from typing import Any
+from typing import Any, Iterator
 import urllib.request
 
 import numpy as np
 import pyarrow.parquet as pq
 import torch
-from torch.utils.data import ConcatDataset, Dataset
+from torch.utils.data import ConcatDataset, Dataset, Sampler
 
 from src.common.fs import read_json
 from src.common.tokenized_lmdb import format_lmdb_key
@@ -41,11 +41,20 @@ REQUIRED_TOKENIZED_COLUMNS = {
     "event_mask",
 }
 
+OPTIONAL_BATCHING_COLUMNS = {
+    "batching_event_count",
+    "batching_profile_token_count",
+}
+
 
 def _normalize_nested_array(value: object, dtype: np.dtype) -> np.ndarray:
     if hasattr(value, "tolist"):
         value = value.tolist()
     return np.asarray(value, dtype=dtype)
+
+
+def _count_mask_entries(value: object) -> int:
+    return int(_normalize_nested_array(value, np.bool_).sum())
 
 
 def read_ids(path: str | Path) -> set[int]:
@@ -218,6 +227,12 @@ class TokenizedDataset(Dataset):
             "calendar_features",
             "event_mask",
         ]
+        self._has_batching_event_count = "batching_event_count" in schema_names
+        self._has_batching_profile_token_count = "batching_profile_token_count" in schema_names
+        if self._has_batching_event_count:
+            self._columns.append("batching_event_count")
+        if self._has_batching_profile_token_count:
+            self._columns.append("batching_profile_token_count")
         self._has_label = "label" in schema_names
         if self._has_label:
             self._columns.append("label")
@@ -316,7 +331,24 @@ class TokenizedDataset(Dataset):
         }
         if self._has_label:
             item["label"] = int(_as_python(row_group["label"][row_idx]))
+        if self._has_batching_event_count:
+            item["batching_event_count"] = int(_as_python(row_group["batching_event_count"][row_idx]))
+        if self._has_batching_profile_token_count:
+            item["batching_profile_token_count"] = int(_as_python(row_group["batching_profile_token_count"][row_idx]))
         return item
+
+    def get_batching_stats(self, idx: int) -> tuple[int, int]:
+        row_group_idx, row_idx = self._resolve_row_position(idx)
+        row_group = self._load_row_group(row_group_idx)
+        if self._has_batching_event_count and self._has_batching_profile_token_count:
+            return (
+                int(_as_python(row_group["batching_event_count"][row_idx])),
+                int(_as_python(row_group["batching_profile_token_count"][row_idx])),
+            )
+        return (
+            _count_mask_entries(_as_python(row_group["event_mask"][row_idx])),
+            _count_mask_entries(_as_python(row_group["profile_mask"][row_idx])),
+        )
 
 
 class LmdbTokenizedDataset(Dataset):
@@ -345,6 +377,10 @@ class LmdbTokenizedDataset(Dataset):
                 dtype=np.int64,
             )
         self._debug_get_count = 0
+        event_counts_path = self.lmdb_path / "batching_event_counts.npy"
+        profile_counts_path = self.lmdb_path / "batching_profile_token_counts.npy"
+        self._batching_event_counts = np.load(event_counts_path) if event_counts_path.exists() else None
+        self._batching_profile_token_counts = np.load(profile_counts_path) if profile_counts_path.exists() else None
         # #region debug-point A:lmdb-dataset-init
         _debug_event(
             "lmdb_dataset_init",
@@ -402,6 +438,160 @@ class LmdbTokenizedDataset(Dataset):
         # #endregion
         return row
 
+    def get_batching_stats(self, idx: int) -> tuple[int, int]:
+        real_idx = int(self._indices[idx])
+        if self._batching_event_counts is not None and self._batching_profile_token_counts is not None:
+            return (
+                int(self._batching_event_counts[real_idx]),
+                int(self._batching_profile_token_counts[real_idx]),
+            )
+        row = self[idx]
+        return (
+            int(row.get("batching_event_count", _count_mask_entries(row["event_mask"]))),
+            int(row.get("batching_profile_token_count", _count_mask_entries(row["profile_mask"]))),
+        )
+
+
+def _get_batching_stats(dataset: Dataset, idx: int) -> tuple[int, int]:
+    if isinstance(dataset, ConcatDataset):
+        dataset_idx = bisect_right(dataset.cumulative_sizes, idx)
+        prev_cumulative = 0 if dataset_idx == 0 else dataset.cumulative_sizes[dataset_idx - 1]
+        return _get_batching_stats(dataset.datasets[dataset_idx], idx - prev_cumulative)
+    getter = getattr(dataset, "get_batching_stats", None)
+    if getter is not None:
+        return getter(idx)
+    row = dataset[idx]
+    return (
+        int(row.get("batching_event_count", _count_mask_entries(row["event_mask"]))),
+        int(row.get("batching_profile_token_count", _count_mask_entries(row["profile_mask"]))),
+    )
+
+
+def _trim_stacked_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    profile_keep = int(batch["profile_mask"].sum(dim=1).max().item()) if batch["profile_mask"].numel() > 0 else 0
+    event_keep = int(batch["event_mask"].sum(dim=1).max().item()) if batch["event_mask"].numel() > 0 else 0
+
+    profile_keys = ("profile_key_ids", "profile_value_ids", "profile_value_pos", "profile_time", "profile_mask")
+    for key in profile_keys:
+        batch[key] = batch[key][:, :profile_keep]
+
+    event_axis_keys = ("event_key_ids", "event_value_ids", "event_value_pos", "event_token_mask", "event_time", "calendar_features", "event_mask", "mlm_labels", "unk_mask")
+    for key in event_axis_keys:
+        if key in batch:
+            batch[key] = batch[key][:, :event_keep]
+
+    if event_keep > 0:
+        event_token_keep = int(batch["event_token_mask"].sum(dim=-1).max().item()) if batch["event_token_mask"].numel() > 0 else 0
+        event_token_keys = ("event_key_ids", "event_value_ids", "event_value_pos", "event_token_mask", "mlm_labels", "unk_mask")
+        for key in event_token_keys:
+            if key in batch:
+                batch[key] = batch[key][:, :, :event_token_keep]
+    return batch
+
+
+class DistributedTokenBudgetBatchSampler(Sampler[list[int]]):
+    def __init__(
+        self,
+        dataset: Dataset,
+        *,
+        token_budget: int,
+        max_event_tokens: int,
+        max_batch_size: int,
+        bucket_boundaries: list[int] | tuple[int, ...] | None = None,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int = 42,
+        num_replicas: int | None = None,
+        rank: int | None = None,
+    ) -> None:
+        if token_budget <= 0:
+            raise ValueError(f"token_budget must be positive, got {token_budget}")
+        self.dataset = dataset
+        self.token_budget = int(token_budget)
+        self.max_event_tokens = max(int(max_event_tokens), 1)
+        self.max_batch_size = max(int(max_batch_size), 1)
+        self.bucket_boundaries = tuple(int(x) for x in (bucket_boundaries or (8, 16, 32, 64, 128, 256)))
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.num_replicas = int(num_replicas if num_replicas is not None else (torch.distributed.get_world_size() if torch.distributed.is_available() and torch.distributed.is_initialized() else 1))
+        self.rank = int(rank if rank is not None else (torch.distributed.get_rank() if torch.distributed.is_available() and torch.distributed.is_initialized() else 0))
+        self.epoch = 0
+        self._cached_epoch: int | None = None
+        self._cached_global_batches: list[list[int]] | None = None
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _sample_cost(self, idx: int) -> tuple[int, int]:
+        event_count, profile_token_count = _get_batching_stats(self.dataset, idx)
+        sample_cost = max(int(event_count), 0) * self.max_event_tokens + max(int(profile_token_count), 0)
+        return max(sample_cost, 1), max(int(event_count), 0)
+
+    def _build_global_batches(self) -> list[list[int]]:
+        if self._cached_epoch == self.epoch and self._cached_global_batches is not None:
+            return self._cached_global_batches
+
+        indices = list(range(len(self.dataset)))
+        rng = np.random.default_rng(self.seed + self.epoch)
+        if self.shuffle:
+            rng.shuffle(indices)
+
+        bucketed_indices: dict[int, list[int]] = defaultdict(list)
+        for idx in indices:
+            _, event_count = self._sample_cost(idx)
+            bucketed_indices[bisect_right(self.bucket_boundaries, event_count)].append(idx)
+
+        bucket_ids = list(bucketed_indices.keys())
+        if self.shuffle:
+            rng.shuffle(bucket_ids)
+
+        batches: list[list[int]] = []
+        for bucket_id in bucket_ids:
+            current_batch: list[int] = []
+            current_cost = 0
+            for idx in bucketed_indices[bucket_id]:
+                sample_cost, _ = self._sample_cost(idx)
+                should_flush = bool(
+                    current_batch
+                    and (current_cost + sample_cost > self.token_budget or len(current_batch) >= self.max_batch_size)
+                )
+                if should_flush:
+                    batches.append(current_batch)
+                    current_batch = []
+                    current_cost = 0
+                current_batch.append(idx)
+                current_cost += sample_cost
+                if len(current_batch) >= self.max_batch_size or sample_cost >= self.token_budget:
+                    batches.append(current_batch)
+                    current_batch = []
+                    current_cost = 0
+            if current_batch and not self.drop_last:
+                batches.append(current_batch)
+
+        if self.shuffle and len(batches) > 1:
+            rng.shuffle(batches)
+
+        if batches and len(batches) % self.num_replicas != 0:
+            remainder = len(batches) % self.num_replicas
+            if self.drop_last:
+                batches = batches[: len(batches) - remainder]
+            else:
+                needed = self.num_replicas - remainder
+                batches.extend([list(batch) for batch in batches[:needed]])
+
+        self._cached_epoch = self.epoch
+        self._cached_global_batches = batches
+        return batches
+
+    def __iter__(self) -> Iterator[list[int]]:
+        global_batches = self._build_global_batches()
+        return iter(global_batches[self.rank :: self.num_replicas])
+
+    def __len__(self) -> int:
+        global_batches = self._build_global_batches()
+        return len(global_batches[self.rank :: self.num_replicas])
+
 
 def pad_collate(batch: list[dict], pad_id: int) -> Batch:
     _ = pad_id
@@ -455,20 +645,36 @@ def pad_collate(batch: list[dict], pad_id: int) -> Batch:
         dtype=torch.bool,
     )
     labels = torch.tensor([x["label"] for x in batch], dtype=torch.float32) if "label" in batch[0] else None
+    stacked = {
+        "entity_id": entity_id,
+        "profile_key_ids": profile_key_ids,
+        "profile_value_ids": profile_value_ids,
+        "profile_value_pos": profile_value_pos,
+        "profile_time": profile_time,
+        "profile_mask": profile_mask,
+        "event_key_ids": event_key_ids,
+        "event_value_ids": event_value_ids,
+        "event_value_pos": event_value_pos,
+        "event_token_mask": event_token_mask,
+        "event_time": event_time,
+        "calendar_features": calendar_features,
+        "event_mask": event_mask,
+    }
+    stacked = _trim_stacked_batch(stacked)
     return Batch(
-        entity_id=entity_id,
-        profile_key_ids=profile_key_ids,
-        profile_value_ids=profile_value_ids,
-        profile_value_pos=profile_value_pos,
-        profile_time=profile_time,
-        profile_mask=profile_mask,
-        event_key_ids=event_key_ids,
-        event_value_ids=event_value_ids,
-        event_value_pos=event_value_pos,
-        event_token_mask=event_token_mask,
-        event_time=event_time,
-        calendar_features=calendar_features,
-        event_mask=event_mask,
+        entity_id=stacked["entity_id"],
+        profile_key_ids=stacked["profile_key_ids"],
+        profile_value_ids=stacked["profile_value_ids"],
+        profile_value_pos=stacked["profile_value_pos"],
+        profile_time=stacked["profile_time"],
+        profile_mask=stacked["profile_mask"],
+        event_key_ids=stacked["event_key_ids"],
+        event_value_ids=stacked["event_value_ids"],
+        event_value_pos=stacked["event_value_pos"],
+        event_token_mask=stacked["event_token_mask"],
+        event_time=stacked["event_time"],
+        calendar_features=stacked["calendar_features"],
+        event_mask=stacked["event_mask"],
         labels=labels,
     )
 

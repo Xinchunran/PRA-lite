@@ -47,11 +47,15 @@ class TokenizedLmdbWriter:
         self._count = 0
         self._uncommitted = 0
         self._entity_ids: list[int] = []
+        self._batching_event_counts: list[int] = []
+        self._batching_profile_token_counts: list[int] = []
 
     def write(self, row: dict[str, Any]) -> None:
         key = format_lmdb_key(self._count)
         self._txn.put(key, pickle.dumps(row, protocol=pickle.HIGHEST_PROTOCOL))
         self._entity_ids.append(int(row["entity_id"]))
+        self._batching_event_counts.append(int(row.get("batching_event_count", -1)))
+        self._batching_profile_token_counts.append(int(row.get("batching_profile_token_count", -1)))
         self._count += 1
         self._uncommitted += 1
         if self._uncommitted >= self.commit_interval:
@@ -63,6 +67,13 @@ class TokenizedLmdbWriter:
         self._txn.put(b"__len__", str(self._count).encode("ascii"))
         self._txn.commit()
         np.save(self.path / "entity_ids.npy", np.asarray(self._entity_ids, dtype=np.int64))
+        if any(value >= 0 for value in self._batching_event_counts):
+            np.save(self.path / "batching_event_counts.npy", np.asarray(self._batching_event_counts, dtype=np.int32))
+        if any(value >= 0 for value in self._batching_profile_token_counts):
+            np.save(
+                self.path / "batching_profile_token_counts.npy",
+                np.asarray(self._batching_profile_token_counts, dtype=np.int32),
+            )
         (self.path / "length.txt").write_text(f"{self._count}\n", encoding="utf-8")
         self.env.sync()
         self.env.close()

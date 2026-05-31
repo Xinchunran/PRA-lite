@@ -10,6 +10,8 @@ import urllib.request
 import numpy as np
 import torch
 
+from src.training.data import _trim_stacked_batch
+
 
 @dataclass
 class MaskedEventCollator:
@@ -154,6 +156,7 @@ class MaskedEventCollator:
             out_rows["unk_mask"].append(torch.tensor(unk_mask))
             out_rows["label"].append(torch.tensor(int(record.get("label", 0)), dtype=torch.long))
         stacked = {key: torch.stack(values, dim=0) for key, values in out_rows.items()}
+        stacked = _trim_stacked_batch(stacked)
         # #region debug-point B:collate-timing
         self._debug_calls += 1
         if self._debug_calls <= 5 or self._debug_calls % 50 == 0:

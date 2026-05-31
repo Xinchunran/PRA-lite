@@ -190,7 +190,7 @@ bash scripts/prepare_ibm_aml_li_pragma_lite_full.sh
 
 Legacy `pragma_c` scripts are still kept in the repo for reference, but the current leakage-prevent preprocessing path is rooted at `pragma_lite_full`.
 
-The Stage C train entry point defaults to `MAX_EVENTS=512` and `split_mode=pragma_c`. You can still fall back to the legacy split logic without changing training code:
+The Stage C train entry point defaults to `MAX_EVENTS=256` and `split_mode=pragma_c`. You can still fall back to the legacy split logic without changing training code:
 
 ```bash
 SPLIT_MODE=random bash scripts/run_ibm_aml_li_medium_pragma_c_pretrain.sh
@@ -216,8 +216,11 @@ data/streaming/ibm_aml_li_medium_pragma_lite_full/
 - The current tokenizer now uses `tokenizer_version=2`, which stores `field_value_types`, `categorical_values`, `max_value_tokens_per_field`, and optional text tokenizer metadata in `tokenizer.json`.
 - Structured encoding now routes fields by type: numeric fields use bucket tokens with an optional `#ZERO` bucket, categorical fields use field-specific `[UNK]`, and textual fields can expand to multiple shared `T:*` tokens.
 - Multi-value fields now replicate the field key and increment `value_pos` as `0, 1, 2, ...`, which activates the existing within-field positional embedding path in the model.
+- History time anchoring is now configurable during preprocessing: `evaluation` reproduces the original PRA-lite anchor, `last_event` follows PRAGMA's "time to last event" history anchor, and `decoupled` uses the PRAGMA anchor while also adding `seconds_since_last_event` as a numeric profile feature. The current default is `last_event`.
 - The model now prepends `[USR]` and `[EVT]` by reading them directly from the shared token embedding table instead of maintaining separate learned CLS parameters.
 - The model now uses a two-layer calendar projection MLP and can tie MLM logits to the shared token embedding table, which is closer to PRAGMA Figure 4 without changing the Stage C split semantics.
+- History ablations can also disable the extra additive time projection and history order embedding through `use_additive_time_proj` and `use_history_order_emb` in the model config.
+- Training now supports event-count bucketed token-budget dynamic batching. PRA-lite still uses rectangular padded tensors, but batches are no longer fixed-size: within each bucket, records are greedily packed under a token budget and collated to the batch-local max active lengths. This improves padding efficiency without implementing PRAGMA's varlen event-token packing kernel.
 - Because `tokenizer_version=2` changes token ids and sequence layouts, new tokenized shards must be rebuilt under the leakage-prevent data root before running a clean comparison against older runs.
 
 ## Notes

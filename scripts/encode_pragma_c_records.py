@@ -132,6 +132,8 @@ def encode_shard(
     max_eval_points_per_account_calibration: int,
     lmdb_map_size_gb: int,
     lmdb_commit_interval: int,
+    history_time_anchor: str,
+    inactivity_profile_col: str,
 ) -> Path:
     output_root = Path(output_root)
     started_at = time.perf_counter()
@@ -164,12 +166,16 @@ def encode_shard(
         max_events=max_events,
         max_event_tokens=max_event_tokens,
         max_profile_tokens=max_profile_tokens,
+        history_time_anchor=history_time_anchor,
+        inactivity_profile_col=inactivity_profile_col,
     )
 
     dataset_writer, split_writers = _build_writers(out_dir, lmdb_map_size_gb, lmdb_commit_interval)
     counts = {split_name: 0 for split_name in STAGE_C_SPLITS}
     history_lengths: list[int] = []
     token_lengths: list[int] = []
+    batching_event_counts: list[int] = []
+    batching_profile_token_counts: list[int] = []
     empty_histories = 0
     progress_every = 10_000
 
@@ -195,6 +201,8 @@ def encode_shard(
                 cfg=cfg,
             )
             history_count = int(len(history))
+            batching_event_count = int(sum(encoded["event_mask"]))
+            batching_profile_token_count = int(sum(encoded["profile_mask"]))
             encoded.update(
                 {
                     "entity_id": int(row.entity_id),
@@ -204,6 +212,8 @@ def encode_shard(
                     "eval_source": str(row.eval_source),
                     "split": str(row.split),
                     "history_event_count": history_count,
+                    "batching_event_count": batching_event_count,
+                    "batching_profile_token_count": batching_profile_token_count,
                 }
             )
             dataset_writer.write(encoded)
@@ -211,6 +221,8 @@ def encode_shard(
             counts[str(row.split)] += 1
             history_lengths.append(history_count)
             token_lengths.append(int(sum(sum(mask_row) for mask_row in encoded["event_token_mask"])))
+            batching_event_counts.append(batching_event_count)
+            batching_profile_token_counts.append(batching_profile_token_count)
             if history_count == 0:
                 empty_histories += 1
             if row_idx % progress_every == 0:
@@ -238,7 +250,17 @@ def encode_shard(
         "history_length_mean": float(sum(history_lengths) / len(history_lengths)) if history_lengths else 0.0,
         "history_length_max": int(max(history_lengths)) if history_lengths else 0,
         "token_length_mean": float(sum(token_lengths) / len(token_lengths)) if token_lengths else 0.0,
+        "batching_event_count_mean": (
+            float(sum(batching_event_counts) / len(batching_event_counts)) if batching_event_counts else 0.0
+        ),
+        "batching_profile_token_count_mean": (
+            float(sum(batching_profile_token_counts) / len(batching_profile_token_counts))
+            if batching_profile_token_counts
+            else 0.0
+        ),
         "empty_history_records": int(empty_histories),
+        "history_time_anchor": history_time_anchor,
+        "inactivity_profile_col": inactivity_profile_col,
     }
     write_json(out_dir / "shard_summary.json", summary)
     print(
@@ -263,6 +285,8 @@ def main() -> None:
     parser.add_argument("--max_eval_points_per_account_calibration", type=int, default=32)
     parser.add_argument("--lmdb_map_size_gb", type=int, default=64)
     parser.add_argument("--lmdb_commit_interval", type=int, default=1024)
+    parser.add_argument("--history_time_anchor", choices=("evaluation", "last_event", "decoupled"), default="last_event")
+    parser.add_argument("--inactivity_profile_col", default="seconds_since_last_event")
     args = parser.parse_args()
     encode_shard(
         args.output_root,
@@ -277,6 +301,8 @@ def main() -> None:
         max_eval_points_per_account_calibration=args.max_eval_points_per_account_calibration,
         lmdb_map_size_gb=args.lmdb_map_size_gb,
         lmdb_commit_interval=args.lmdb_commit_interval,
+        history_time_anchor=args.history_time_anchor,
+        inactivity_profile_col=args.inactivity_profile_col,
     )
 
 

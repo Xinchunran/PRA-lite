@@ -24,6 +24,6 @@ conda activate pragma-lite
 
 export WORK_ROOT="${WORK_ROOT:-data/streaming/ibm_aml_li_medium_pragma_lite_full}"
 export NUM_SHARDS="${NUM_SHARDS:-128}"
-export MAX_EVENTS="${MAX_EVENTS:-512}"
+export MAX_EVENTS="${MAX_EVENTS:-256}"
 
 bash "${PROJECT_ROOT}/scripts/prepare_ibm_aml_li_pragma_lite_full_encode_shard.sh" "${SLURM_ARRAY_TASK_ID}"

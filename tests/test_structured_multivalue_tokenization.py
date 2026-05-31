@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
-from src.tokenizer.structured import encode_event_features
+from src.tokenizer.structured import _encode_event_features_with_anchor, encode_event_features
+from src.tokenizer.time import soft_log_seconds
 from src.tokenizer.vocab import TokenizerVocab
 
 
@@ -88,3 +90,53 @@ def test_multivalue_padding_mask_stays_consistent() -> None:
         for pos, mask in zip(encoded["event_value_pos"][0], encoded["event_token_mask"][0])
         if mask == 0
     )
+
+
+def test_history_time_anchor_switches_between_evaluation_and_last_event() -> None:
+    vocab = _make_vocab()
+    events = [
+        {
+            "timestamp": "2024-01-01T00:00:00Z",
+            "description": "metal plan",
+            "direction": "out",
+            "amount": 12.0,
+        },
+        {
+            "timestamp": "2024-01-03T00:00:00Z",
+            "description": "metal plan",
+            "direction": "out",
+            "amount": 4.0,
+        },
+    ]
+    evaluation_time = pd.Timestamp("2024-01-05T00:00:00Z")
+
+    anchor_eval = _encode_event_features_with_anchor(
+        vocab=vocab,
+        events=events,
+        evaluation_time=evaluation_time,
+        max_events=2,
+        max_event_tokens=6,
+        history_time_anchor="evaluation",
+    )
+    anchor_last = _encode_event_features_with_anchor(
+        vocab=vocab,
+        events=events,
+        evaluation_time=evaluation_time,
+        max_events=2,
+        max_event_tokens=6,
+        history_time_anchor="last_event",
+    )
+
+    assert anchor_eval["event_time"][:2] == pytest.approx(
+        [
+            float(soft_log_seconds(4 * 24 * 3600)),
+            float(soft_log_seconds(2 * 24 * 3600)),
+        ]
+    )
+    assert anchor_last["event_time"][:2] == pytest.approx(
+        [
+            float(soft_log_seconds(2 * 24 * 3600)),
+            0.0,
+        ]
+    )
+    assert anchor_last["seconds_since_last_event"] == pytest.approx(2 * 24 * 3600)

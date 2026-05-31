@@ -31,6 +31,8 @@ class PragmaLiteConfig:
     calendar_mlp: bool = True
     calendar_hidden_dim: int | None = None
     tie_mlm_to_embedding: bool = True
+    use_additive_time_proj: bool = True
+    use_history_order_emb: bool = True
 
     def __post_init__(self) -> None:
         if self.d_ffn is None:
@@ -309,7 +311,7 @@ class PragmaLiteModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, _ = profile_key_ids.shape
         token_hidden = self.kv_embedding(profile_key_ids, profile_value_ids, profile_value_pos)
-        if profile_time is not None:
+        if self.cfg.use_additive_time_proj and profile_time is not None:
             token_hidden = token_hidden + self.time_proj(profile_time.unsqueeze(-1).to(token_hidden.dtype))
         cls_token = self._shared_special_token_embedding(self.usr_token_id, batch_size).to(token_hidden.dtype)
         hidden = torch.cat([cls_token, token_hidden], dim=1)
@@ -385,10 +387,10 @@ class PragmaLiteModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         history_tokens = torch.cat([profile_embedding.unsqueeze(1), event_embeddings], dim=1)
         batch_size = history_tokens.size(0)
-        if event_embeddings.size(1) > 0:
+        if self.cfg.use_history_order_emb and event_embeddings.size(1) > 0:
             order = torch.arange(1, event_embeddings.size(1) + 1, device=history_tokens.device)
             history_tokens[:, 1:, :] = history_tokens[:, 1:, :] + self.history_order_emb(order)[None, :, :]
-        if event_time is not None and event_embeddings.size(1) > 0:
+        if self.cfg.use_additive_time_proj and event_time is not None and event_embeddings.size(1) > 0:
             history_tokens[:, 1:, :] = history_tokens[:, 1:, :] + self.time_proj(
                 event_time.unsqueeze(-1).to(history_tokens.dtype)
             )

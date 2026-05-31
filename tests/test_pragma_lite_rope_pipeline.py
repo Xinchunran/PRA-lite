@@ -71,6 +71,44 @@ def test_structured_backbone_returns_mlm_logits() -> None:
     assert torch.isfinite(hidden["record_embedding"]).all()
 
 
+def test_structured_backbone_runs_with_time_and_order_ablation_flags_disabled() -> None:
+    cfg = PragmaLiteConfig(
+        vocab_size=64,
+        d_model=32,
+        n_heads=4,
+        d_ffn=64,
+        n_layers=1,
+        profile_layers=1,
+        event_layers=1,
+        history_layers=1,
+        dropout=0.0,
+        max_profile_tokens=4,
+        max_event_tokens=4,
+        max_events=3,
+        use_additive_time_proj=False,
+        use_history_order_emb=False,
+    )
+    model = PragmaLiteModel(cfg)
+    batch = {
+        "profile_key_ids": torch.tensor([[10, 11, 0, 0]], dtype=torch.long),
+        "profile_value_ids": torch.tensor([[20, 21, 0, 0]], dtype=torch.long),
+        "profile_value_pos": torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+        "profile_time": torch.tensor([[5.0, 1.0, 0.0, 0.0]], dtype=torch.float32),
+        "profile_mask": torch.tensor([[1, 1, 0, 0]], dtype=torch.bool),
+        "event_key_ids": torch.tensor([[[30, 31, 0, 0], [40, 41, 0, 0], [0, 0, 0, 0]]], dtype=torch.long),
+        "event_value_ids": torch.tensor([[[32, 33, 0, 0], [42, 43, 0, 0], [0, 0, 0, 0]]], dtype=torch.long),
+        "event_value_pos": torch.zeros((1, 3, 4), dtype=torch.long),
+        "event_token_mask": torch.tensor([[[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 0, 0]]], dtype=torch.bool),
+        "event_time": torch.tensor([[6.0, 2.0, 0.0]], dtype=torch.float32),
+        "calendar_features": torch.tensor([[[0.0] * 6, [1.0] * 6, [0.0] * 6]], dtype=torch.float32),
+        "event_mask": torch.tensor([[1, 1, 0]], dtype=torch.bool),
+    }
+
+    logits = model(**batch, return_mlm_logits=True)
+    assert logits.shape == (1, 3, 4, cfg.vocab_size)
+    assert torch.isfinite(logits).all()
+
+
 def test_pretrain_pipeline_smoke_runs_with_rope_hierarchical_model(tmp_path: Path, monkeypatch) -> None:
     config_dir = tmp_path / "configs"
     data_dir = tmp_path / "data"

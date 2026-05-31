@@ -21,6 +21,9 @@ NUM_SHARDS="${NUM_SHARDS:-128}"
 MAX_EVAL_POINTS_PER_ACCOUNT_TRAIN="${MAX_EVAL_POINTS_PER_ACCOUNT_TRAIN:-64}"
 MAX_EVAL_POINTS_PER_ACCOUNT_VALID="${MAX_EVAL_POINTS_PER_ACCOUNT_VALID:-32}"
 MAX_EVAL_POINTS_PER_ACCOUNT_CALIBRATION="${MAX_EVAL_POINTS_PER_ACCOUNT_CALIBRATION:-32}"
+MAX_EVENTS="${MAX_EVENTS:-256}"
+HISTORY_TIME_ANCHOR="${HISTORY_TIME_ANCHOR:-last_event}"
+INACTIVITY_PROFILE_COL="${INACTIVITY_PROFILE_COL:-seconds_since_last_event}"
 
 mkdir -p "${WORK_ROOT}"
 
@@ -38,7 +41,10 @@ mkdir -p "${WORK_ROOT}"
 "${PYTHON_BIN}" scripts/build_pragma_c_tokenizer.py \
   --output_root "${WORK_ROOT}" \
   --max_history_events "${MAX_HISTORY_EVENTS}" \
-  --profile_sample_limit "${PROFILE_SAMPLE_LIMIT}"
+  --profile_sample_limit "${PROFILE_SAMPLE_LIMIT}" \
+  --max_events "${MAX_EVENTS}" \
+  --history_time_anchor "${HISTORY_TIME_ANCHOR}" \
+  --inactivity_profile_col "${INACTIVITY_PROFILE_COL}"
 
 "${PYTHON_BIN}" scripts/audit_pragma_c_leakage.py \
   --output_root "${WORK_ROOT}"

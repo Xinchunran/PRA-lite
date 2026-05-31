@@ -87,7 +87,14 @@ def test_pragma_c_minimal_pipeline_builds_isolated_dataset(tmp_path: Path) -> No
     canonical_path = build_canonical_transactions(raw_dir, output_root, raw_csv="LI-Medium_Trans.csv")
     eval_points_path = build_eval_points(output_root)
     assigned_eval_points_path = assign_splits(output_root)
-    tokenizer_dir = build_tokenizer(output_root, profile_sample_limit=32, max_history_events=16)
+    tokenizer_dir = build_tokenizer(
+        output_root,
+        profile_sample_limit=32,
+        max_history_events=16,
+        max_events=8,
+        history_time_anchor="decoupled",
+        inactivity_profile_col="seconds_since_last_event",
+    )
     encode_index_dir = build_encode_index(
         output_root,
         num_shards=1,
@@ -108,6 +115,8 @@ def test_pragma_c_minimal_pipeline_builds_isolated_dataset(tmp_path: Path) -> No
         max_eval_points_per_account_calibration=2,
         lmdb_map_size_gb=1,
         lmdb_commit_interval=1,
+        history_time_anchor="last_event",
+        inactivity_profile_col="seconds_since_last_event",
     )
     manifest_path = build_manifest(output_root)
     leakage_path = audit_leakage(output_root)
@@ -134,6 +143,8 @@ def test_pragma_c_minimal_pipeline_builds_isolated_dataset(tmp_path: Path) -> No
     assert tokenizer_payload["tokenizer_version"] == 2
     assert tokenizer_payload["max_value_tokens_per_field"] == 4
     assert tokenizer_payload["field_value_types"]["E:direction"] == "categorical"
+    assert "seconds_since_last_event" in tokenizer_payload["profile_cols"]
+    assert tokenizer_payload["field_value_types"]["P:seconds_since_last_event"] == "numeric"
 
     leakage = json.loads(leakage_path.read_text(encoding="utf-8"))
     assert leakage["passes"] is True
@@ -141,3 +152,4 @@ def test_pragma_c_minimal_pipeline_builds_isolated_dataset(tmp_path: Path) -> No
     shard_summary = json.loads((shard_dir / "shard_summary.json").read_text(encoding="utf-8"))
     assert shard_summary["split_mode"] == "pragma_c"
     assert shard_summary["max_events"] == 8
+    assert shard_summary["history_time_anchor"] == "last_event"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -13,9 +13,11 @@ from src.tokenizer.vocab import TokenizerVocab
 
 @dataclass(frozen=True)
 class StructuredRecordConfig:
-    max_events: int = 512
+    max_events: int = 256
     max_event_tokens: int = 24
     max_profile_tokens: int = 200
+    history_time_anchor: Literal["evaluation", "last_event", "decoupled"] = "last_event"
+    inactivity_profile_col: str = "seconds_since_last_event"
 
 
 def calendar_features(ts: pd.Timestamp) -> list[float]:
@@ -29,6 +31,14 @@ def calendar_features(ts: pd.Timestamp) -> list[float]:
 def relative_time_feature(event_ts: pd.Timestamp, evaluation_ts: pd.Timestamp) -> float:
     try:
         delta_seconds = max(0.0, (evaluation_ts - event_ts).total_seconds())
+    except Exception:
+        return 0.0
+    return float(soft_log_seconds(delta_seconds))
+
+
+def _time_feature_to_anchor(event_ts: pd.Timestamp, anchor_ts: pd.Timestamp) -> float:
+    try:
+        delta_seconds = max(0.0, (anchor_ts - event_ts).total_seconds())
     except Exception:
         return 0.0
     return float(soft_log_seconds(delta_seconds))
@@ -124,6 +134,32 @@ def _encode_field(
     return [_encode_categorical_value(vocab, namespace, col, value)]
 
 
+def _collect_valid_event_rows(
+    events: pd.DataFrame | list[dict[str, Any]],
+    max_events: int,
+) -> list[tuple[dict[str, Any] | pd.Series, pd.Timestamp]]:
+    if isinstance(events, pd.DataFrame):
+        event_rows = events.to_dict("records")
+    else:
+        event_rows = list(events)
+
+    valid_rows: list[tuple[dict[str, Any] | pd.Series, pd.Timestamp]] = []
+    for row in event_rows:
+        if isinstance(row, pd.Series):
+            timestamp = row["timestamp"]
+        elif isinstance(row, dict) and "fields" in row:
+            timestamp = row.get("timestamp")
+        else:
+            timestamp = row.get("timestamp") if isinstance(row, dict) else None
+        ts = _maybe_parse_ts(timestamp)
+        if ts is None:
+            continue
+        valid_rows.append((row, ts))
+    if max_events > 0 and len(valid_rows) > max_events:
+        valid_rows = valid_rows[-max_events:]
+    return valid_rows
+
+
 def _pad_pairs(
     key_ids: list[int],
     value_ids: list[int],
@@ -204,10 +240,31 @@ def encode_event_features(
     max_events: int,
     max_event_tokens: int,
 ) -> dict[str, list]:
-    if isinstance(events, pd.DataFrame):
-        event_rows = events.to_dict("records")
+    return _encode_event_features_with_anchor(
+        vocab=vocab,
+        events=events,
+        evaluation_time=evaluation_time,
+        max_events=max_events,
+        max_event_tokens=max_event_tokens,
+        history_time_anchor="evaluation",
+    )
+
+
+def _encode_event_features_with_anchor(
+    vocab: TokenizerVocab,
+    events: pd.DataFrame | list[dict[str, Any]],
+    evaluation_time: pd.Timestamp,
+    max_events: int,
+    max_event_tokens: int,
+    history_time_anchor: Literal["evaluation", "last_event", "decoupled"],
+) -> dict[str, list]:
+    included_rows = _collect_valid_event_rows(events, max_events=max_events)
+    if included_rows:
+        last_event_ts = max(ts for _, ts in included_rows)
+        inactivity_gap_seconds = max(0.0, (evaluation_time - last_event_ts).total_seconds())
     else:
-        event_rows = list(events)
+        last_event_ts = evaluation_time
+        inactivity_gap_seconds = 0.0
 
     event_key_ids: list[list[int]] = []
     event_value_ids: list[list[int]] = []
@@ -217,19 +274,13 @@ def encode_event_features(
     calendar_rows: list[list[float]] = []
     event_mask: list[int] = []
 
-    for row in event_rows[:max_events]:
+    for row, ts in included_rows:
         if isinstance(row, pd.Series):
             fields = row
-            timestamp = row["timestamp"]
         elif isinstance(row, dict) and "fields" in row:
             fields = row.get("fields", {}) or {}
-            timestamp = row.get("timestamp")
         else:
             fields = row
-            timestamp = row.get("timestamp") if isinstance(row, dict) else None
-        ts = _maybe_parse_ts(timestamp)
-        if ts is None:
-            continue
 
         key_ids: list[int] = []
         value_ids: list[int] = []
@@ -264,7 +315,13 @@ def encode_event_features(
         event_value_ids.append(padded_value_ids)
         event_value_pos.append(padded_value_pos)
         event_token_mask.append(padded_mask)
-        event_time.append(relative_time_feature(ts, evaluation_time))
+        if history_time_anchor == "evaluation":
+            anchor_ts = evaluation_time
+        elif history_time_anchor in {"last_event", "decoupled"}:
+            anchor_ts = last_event_ts
+        else:
+            raise ValueError(f"Unknown history_time_anchor: {history_time_anchor}")
+        event_time.append(_time_feature_to_anchor(ts, anchor_ts))
         calendar_rows.append(calendar_features(ts))
         event_mask.append(1)
 
@@ -285,6 +342,8 @@ def encode_event_features(
         "event_time": event_time,
         "calendar_features": calendar_rows,
         "event_mask": event_mask,
+        "seconds_since_last_event": float(inactivity_gap_seconds),
+        "last_event_ts": last_event_ts.isoformat() if last_event_ts is not None else "",
     }
 
 
@@ -295,22 +354,32 @@ def encode_record(
     evaluation_time: pd.Timestamp,
     cfg: StructuredRecordConfig,
 ) -> dict[str, list]:
+    event_encoded = _encode_event_features_with_anchor(
+        vocab=vocab,
+        events=events,
+        evaluation_time=evaluation_time,
+        max_events=cfg.max_events,
+        max_event_tokens=cfg.max_event_tokens,
+        history_time_anchor=cfg.history_time_anchor,
+    )
+
+    if isinstance(profile, pd.Series):
+        profile_aug: dict[str, Any] = profile.to_dict()
+    else:
+        profile_aug = dict(profile)
+    if cfg.history_time_anchor == "decoupled":
+        profile_aug[cfg.inactivity_profile_col] = float(event_encoded["seconds_since_last_event"])
+
+    profile_encoded = encode_profile_features(
+        vocab=vocab,
+        profile=profile_aug,
+        evaluation_time=evaluation_time,
+        max_profile_tokens=cfg.max_profile_tokens,
+    )
+
     encoded = {}
-    encoded.update(
-        encode_profile_features(
-            vocab=vocab,
-            profile=profile,
-            evaluation_time=evaluation_time,
-            max_profile_tokens=cfg.max_profile_tokens,
-        )
-    )
-    encoded.update(
-        encode_event_features(
-            vocab=vocab,
-            events=events,
-            evaluation_time=evaluation_time,
-            max_events=cfg.max_events,
-            max_event_tokens=cfg.max_event_tokens,
-        )
-    )
+    encoded.update(profile_encoded)
+    encoded.update(event_encoded)
+    encoded.pop("last_event_ts", None)
+    encoded.pop("seconds_since_last_event", None)
     return encoded
