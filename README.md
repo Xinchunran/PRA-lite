@@ -14,10 +14,19 @@ This table compares the original [PRAGMA paper (arXiv:2604.08649)](https://arxiv
 | | Event-local attention kernel that prevents cross-event token attention | ☑️ | ✖️ |
 | | RoPE time/position encoding in profile and history encoders | ☑️ | ☑️ |
 | | Key-value-time representation with fused history context | ☑️ | ☑️ |
+| | Shared key/value embedding table | ☑️ | ☑️ |
+| | Learnable `[USR]` / `[EVT]` sequence prefix tokens | ☑️ | ☑️ |
+| | `[USR]` / `[EVT]` taken directly from shared token table | ☑️ | ✖️ |
+| | MLM logits matched against shared embedding table | ☑️ | ☑️ |
 | **Data Processing** | Key-Value-Time Tokenisation | ☑️ | ☑️ |
 | | Numeric Percentile Bucketing | ☑️ | ☑️ |
 | | Log-seconds Relative Time Feature | ☑️ | ☑️ |
 | | Calendar Time Features | ☑️ | ☑️ |
+| | Two-layer calendar feature MLP | ☑️ | ☑️ |
+| | Multi-value field key replication | ☑️ | ☑️ |
+| | Within-field value positions (`0,1,2,...`) | ☑️ | ☑️ |
+| | Static sine/cosine within-field positional encoding | ☑️ | ✖️ |
+| | Textual field sub-token expansion | ☑️ | ☑️ |
 | | LMDB-backed storage / shard-based streaming pipeline | ☑️ | ☑️ |
 | | Low-frequency Vocab Pruning | ✖️ | ☑️ |
 
@@ -165,7 +174,7 @@ IBM AML experiments now keep two split protocols in parallel:
 | Split Protocol | Default Data Root | Record Policy | Split Rule | Recommended Use |
 | :--- | :--- | :--- | :--- | :--- |
 | Random / Hash Split | `data/streaming/ibm_aml_li_medium` | One account-level evaluation point per encoded sample in the legacy streaming pipeline | Hash-by-entity with `train/valid/test` fractions | Fast iteration, backward-compatible baselines, quick MLM debugging |
-| Stage C PRAGMA-Style Split | `data/streaming/ibm_aml_li_medium_pragma_c` | Multi-evaluation-point account-centric records tied to real transaction timestamps | Global `evaluation_time` split with `train / embargo / valid / calibration / embargo / test` | Financial-style temporal validation, leakage control, isolated Stage C checkpoints |
+| PRA-lite Leakage-Prevent Split | `data/streaming/ibm_aml_li_medium_pragma_lite_full` | Multi-evaluation-point account-centric records tied to real transaction timestamps with Figure 4-aligned tokenization/model updates | Global `evaluation_time` split with `train / embargo / valid / calibration / embargo / test` | Financial-style temporal validation, leakage control, isolated preprocessing and pretraining runs |
 
 The legacy random/hash split entry point remains:
 
@@ -173,12 +182,13 @@ The legacy random/hash split entry point remains:
 bash scripts/run_ibm_aml_medium_streaming.sh
 ```
 
-Stage C uses a separate data root, tokenizer, manifest, logs, plots, and checkpoints:
+The leakage-prevent path uses a separate data root, tokenizer, manifest, logs, plots, and checkpoints:
 
 ```bash
-bash scripts/prepare_ibm_aml_li_pragma_c.sh
-bash scripts/run_ibm_aml_li_medium_pragma_c_pretrain.sh
+bash scripts/prepare_ibm_aml_li_pragma_lite_full.sh
 ```
+
+Legacy `pragma_c` scripts are still kept in the repo for reference, but the current leakage-prevent preprocessing path is rooted at `pragma_lite_full`.
 
 The Stage C train entry point defaults to `MAX_EVENTS=512` and `split_mode=pragma_c`. You can still fall back to the legacy split logic without changing training code:
 
@@ -186,10 +196,10 @@ The Stage C train entry point defaults to `MAX_EVENTS=512` and `split_mode=pragm
 SPLIT_MODE=random bash scripts/run_ibm_aml_li_medium_pragma_c_pretrain.sh
 ```
 
-When Stage C is launched through `scripts/run_ibm_aml_li_medium_pragma_c_pretrain.sh`, logs and checkpoints are written to an isolated run root:
+When the current leakage-prevent preprocessing path is launched, processed data is written to:
 
 ```text
-runs/pretrain_ibm_aml_li_medium_pragma_c/
+data/streaming/ibm_aml_li_medium_pragma_lite_full/
 ```
 
 ### Stage C Training Notes
@@ -199,6 +209,15 @@ runs/pretrain_ibm_aml_li_medium_pragma_c/
 - A step is only fully skipped when **all** ranks have no supervised MLM targets. In that case the log prints `skipped=no_masked_targets`.
 - Older Stage C runs may still contain `Grad strides do not match bucket view strides` warnings near the top of `train.log`. The current model code canonicalizes the grad layout for the learnable CLS tokens, so check the most recent launch block before assuming the warning is still active.
 - If `train.log` contains multiple restarts, read it by launch block rather than assuming one continuous run. The newest run begins at the latest `Using TORCHRUN_BIN=...` line.
+
+### Figure 4 Alignment
+
+- The current leakage-prevent split and controls stay unchanged. Figure 4 alignment is applied on top of the existing Stage C temporal protocol, not by relaxing the temporal split.
+- The current tokenizer now uses `tokenizer_version=2`, which stores `field_value_types`, `categorical_values`, `max_value_tokens_per_field`, and optional text tokenizer metadata in `tokenizer.json`.
+- Structured encoding now routes fields by type: numeric fields use bucket tokens with an optional `#ZERO` bucket, categorical fields use field-specific `[UNK]`, and textual fields can expand to multiple shared `T:*` tokens.
+- Multi-value fields now replicate the field key and increment `value_pos` as `0, 1, 2, ...`, which activates the existing within-field positional embedding path in the model.
+- The model now uses a two-layer calendar projection MLP and can tie MLM logits to the shared token embedding table, which is closer to PRAGMA Figure 4 without changing the Stage C split semantics.
+- Because `tokenizer_version=2` changes token ids and sequence layouts, new tokenized shards must be rebuilt under the leakage-prevent data root before running a clean comparison against older runs.
 
 ## Notes
 

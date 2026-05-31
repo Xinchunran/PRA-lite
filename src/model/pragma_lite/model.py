@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 @dataclass
@@ -25,6 +26,9 @@ class PragmaLiteConfig:
     rope_base: float = 10000.0
     use_time_encoding: bool = True
     use_profile_encoder: bool = True
+    calendar_mlp: bool = True
+    calendar_hidden_dim: int | None = None
+    tie_mlm_to_embedding: bool = True
 
     def __post_init__(self) -> None:
         if self.d_ffn is None:
@@ -33,6 +37,8 @@ class PragmaLiteConfig:
             self.event_layers = self.n_layers
         if self.history_layers is None:
             self.history_layers = self.n_layers
+        if self.calendar_hidden_dim is None:
+            self.calendar_hidden_dim = self.d_model
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -252,7 +258,15 @@ class PragmaLiteModel(nn.Module):
             rope_base=cfg.rope_base,
         )
         self.history_order_emb = nn.Embedding(cfg.max_events + 1, self.d_model)
-        self.calendar_proj = nn.Linear(6, self.d_model)
+        if cfg.calendar_mlp:
+            self.calendar_proj = nn.Sequential(
+                nn.Linear(6, cfg.calendar_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.calendar_hidden_dim, self.d_model),
+            )
+        else:
+            self.calendar_proj = nn.Linear(6, self.d_model)
         self.time_proj = nn.Sequential(nn.Linear(1, self.d_model), nn.Tanh())
         self.fusion = nn.Sequential(
             nn.Linear(self.d_model * 2, self.d_model),
@@ -262,8 +276,10 @@ class PragmaLiteModel(nn.Module):
         self.mlm_head = nn.Sequential(
             nn.Linear(self.d_model * 3, self.d_model),
             nn.GELU(),
-            nn.Linear(self.d_model, self.vocab_size),
+            nn.LayerNorm(self.d_model),
         )
+        self.mlm_bias = nn.Parameter(torch.zeros(self.vocab_size)) if cfg.tie_mlm_to_embedding else None
+        self.mlm_out = None if cfg.tie_mlm_to_embedding else nn.Linear(self.d_model, self.vocab_size)
         self.cls_head = nn.Linear(self.d_model, 1)
         nn.init.normal_(self.profile_cls, std=0.02)
         nn.init.normal_(self.event_cls, std=0.02)
@@ -393,7 +409,12 @@ class PragmaLiteModel(nn.Module):
         else:
             raise ValueError(f"Unsupported local_context rank: {local_context.ndim}")
         fused = torch.cat([local_context, event_context, user_context], dim=-1)
-        return self.mlm_head(fused)
+        hidden = self.mlm_head(fused)
+        if self.cfg.tie_mlm_to_embedding:
+            return F.linear(hidden, self.kv_embedding.token_emb.weight, self.mlm_bias)
+        if self.mlm_out is None:
+            raise RuntimeError("mlm_out must be initialized when tie_mlm_to_embedding is disabled")
+        return self.mlm_out(hidden)
 
     def forward(
         self,

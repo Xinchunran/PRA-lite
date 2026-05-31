@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.tokenizer.text_bpe import SimpleTextTokenizer
 from src.tokenizer.time import periodic_encode, soft_log_seconds
 from src.tokenizer.vocab import TokenizerVocab
 
@@ -52,14 +53,75 @@ def _maybe_parse_ts(value: Any) -> pd.Timestamp | None:
     return ts
 
 
-def _encode_value(vocab: TokenizerVocab, namespace: str, col: str, value: Any) -> int:
-    col_key = f"{namespace}:{col}"
-    if col_key in vocab.numeric_binners:
-        bucket = vocab.numeric_binners[col_key].bucket(value)
-        bucket = max(bucket, 0)
-        return vocab.encode_token(f"V:{namespace}:{col}#B{bucket}")
-    token_value = "[NA]" if pd.isna(value) else str(value)
-    return vocab.encode_token(f"V:{namespace}:{col}={token_value}")
+def _normalize_categorical_value(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "[NA]"
+    return str(value).strip().lower() or "[NA]"
+
+
+def _encode_numeric_value(vocab: TokenizerVocab, namespace: str, col: str, value: Any) -> int:
+    field_key = f"{namespace}:{col}"
+    if value is None or pd.isna(value):
+        return vocab.encode_token(f"V:{field_key}#[NA]")
+    try:
+        numeric_value = float(value)
+    except Exception:
+        return vocab.encode_token(f"V:{field_key}#[NA]")
+    if vocab.numeric_zero_bucket and numeric_value == 0.0:
+        return vocab.encode_token(f"V:{field_key}#ZERO")
+    bucket = vocab.numeric_binners.get(field_key, None)
+    if bucket is None:
+        return vocab.unk_id
+    return vocab.encode_token(f"V:{field_key}#B{max(bucket.bucket(numeric_value), 0)}")
+
+
+def _encode_categorical_value(vocab: TokenizerVocab, namespace: str, col: str, value: Any) -> int:
+    field_key = f"{namespace}:{col}"
+    token_value = _normalize_categorical_value(value)
+    token = f"V:{field_key}={token_value}"
+    if token in vocab.token_to_id:
+        return vocab.token_to_id[token]
+    return vocab.encode_token(f"V:{field_key}=[UNK]")
+
+
+def _encode_textual_value(
+    vocab: TokenizerVocab,
+    namespace: str,
+    col: str,
+    value: Any,
+    max_value_tokens: int,
+) -> list[int]:
+    _ = namespace, col
+    if value is None or pd.isna(value):
+        return [vocab.encode_token("T:[NA]")]
+    text = str(value)
+    if not text.strip():
+        return [vocab.encode_token("T:[NA]")]
+    tokenizer = vocab.text_tokenizer or SimpleTextTokenizer(vocab=["[UNK]"])
+    encoding = tokenizer.encode(text)
+    pieces = list(getattr(encoding, "tokens", []))[:max_value_tokens]
+    if not pieces:
+        return [vocab.encode_token("T:[UNK]")]
+    return [vocab.encode_token(f"T:{piece}") for piece in pieces]
+
+
+def _encode_field(
+    vocab: TokenizerVocab,
+    namespace: str,
+    col: str,
+    value: Any,
+    max_value_tokens: int,
+) -> list[int]:
+    field_key = f"{namespace}:{col}"
+    value_type = vocab.field_value_types.get(
+        field_key,
+        "numeric" if field_key in vocab.numeric_binners else "categorical",
+    )
+    if value_type == "numeric":
+        return [_encode_numeric_value(vocab, namespace, col, value)]
+    if value_type == "textual":
+        return _encode_textual_value(vocab, namespace, col, value, max_value_tokens=max_value_tokens)
+    return [_encode_categorical_value(vocab, namespace, col, value)]
 
 
 def _pad_pairs(
@@ -97,16 +159,26 @@ def encode_profile_features(
     profile_time: list[float] = []
 
     for col in vocab.profile_cols:
-        key_ids.append(vocab.encode_token(f"K:P:{col}"))
         value = profile[col] if col in profile else None
-        value_ids.append(_encode_value(vocab, "P", col, value))
-        value_pos.append(0)
-
+        key_id = vocab.encode_token(f"K:P:{col}")
+        field_value_ids = _encode_field(
+            vocab=vocab,
+            namespace="P",
+            col=col,
+            value=value,
+            max_value_tokens=vocab.max_value_tokens_per_field,
+        )
         parsed_ts = _maybe_parse_ts(value) if _is_time_like_column(col) else None
-        if parsed_ts is not None:
-            profile_time.append(relative_time_feature(parsed_ts, evaluation_time))
-        else:
-            profile_time.append(0.0)
+        time_value = relative_time_feature(parsed_ts, evaluation_time) if parsed_ts is not None else 0.0
+        for pos, value_id in enumerate(field_value_ids):
+            if len(key_ids) >= max_profile_tokens:
+                break
+            key_ids.append(key_id)
+            value_ids.append(value_id)
+            value_pos.append(pos)
+            profile_time.append(time_value)
+        if len(key_ids) >= max_profile_tokens:
+            break
 
     key_ids, value_ids, value_pos, profile_time, profile_mask = _pad_pairs(
         key_ids,
@@ -163,10 +235,22 @@ def encode_event_features(
         value_ids: list[int] = []
         value_pos: list[int] = []
         for col in vocab.event_cols:
+            if len(key_ids) >= max_event_tokens:
+                break
             value = fields[col] if col in fields else None
-            key_ids.append(vocab.encode_token(f"K:E:{col}"))
-            value_ids.append(_encode_value(vocab, "E", col, value))
-            value_pos.append(0)
+            key_id = vocab.encode_token(f"K:E:{col}")
+            field_value_ids = _encode_field(
+                vocab=vocab,
+                namespace="E",
+                col=col,
+                value=value,
+                max_value_tokens=vocab.max_value_tokens_per_field,
+            )
+            remaining = max_event_tokens - len(key_ids)
+            for pos, value_id in enumerate(field_value_ids[:remaining]):
+                key_ids.append(key_id)
+                value_ids.append(value_id)
+                value_pos.append(pos)
 
         padded_key_ids, padded_value_ids, padded_value_pos, _, padded_mask = _pad_pairs(
             key_ids,

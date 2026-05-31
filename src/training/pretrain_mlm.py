@@ -600,6 +600,13 @@ def main() -> None:
         profile_layers=int(model_cfg.get("profile_layers", 1)),
         event_layers=int(model_cfg.get("event_layers", int(model_cfg.get("n_layers", 4)))),
         history_layers=int(model_cfg.get("history_layers", int(model_cfg.get("n_layers", 4)))),
+        calendar_mlp=bool(model_cfg.get("calendar_mlp", True)),
+        calendar_hidden_dim=(
+            int(model_cfg["calendar_hidden_dim"])
+            if model_cfg.get("calendar_hidden_dim") is not None
+            else None
+        ),
+        tie_mlm_to_embedding=bool(model_cfg.get("tie_mlm_to_embedding", True)),
     )
     if manifest_path is None:
         _require_lmdb_for_full_scale(data_dir)

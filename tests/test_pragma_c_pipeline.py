@@ -130,6 +130,11 @@ def test_pragma_c_minimal_pipeline_builds_isolated_dataset(tmp_path: Path) -> No
     assert manifest["tokenizer_policy"] == "train_only_fit"
     assert manifest["shards"][0]["name"] == "shard_00000"
 
+    tokenizer_payload = json.loads((tokenizer_dir / "tokenizer.json").read_text(encoding="utf-8"))
+    assert tokenizer_payload["tokenizer_version"] == 2
+    assert tokenizer_payload["max_value_tokens_per_field"] == 4
+    assert tokenizer_payload["field_value_types"]["E:direction"] == "categorical"
+
     leakage = json.loads(leakage_path.read_text(encoding="utf-8"))
     assert leakage["passes"] is True
 
