@@ -27,7 +27,9 @@ MAX_HISTORY_EVENTS="${MAX_HISTORY_EVENTS:-6500}"
 MAX_EVAL_POINTS_PER_ACCOUNT_TRAIN="${MAX_EVAL_POINTS_PER_ACCOUNT_TRAIN:-64}"
 MAX_EVAL_POINTS_PER_ACCOUNT_VALID="${MAX_EVAL_POINTS_PER_ACCOUNT_VALID:-32}"
 MAX_EVAL_POINTS_PER_ACCOUNT_CALIBRATION="${MAX_EVAL_POINTS_PER_ACCOUNT_CALIBRATION:-32}"
+MANIFEST_LOCK="${WORK_ROOT}/.manifest.lock"
 
+echo "[pragma_c_encode_wrapper] shard=${SHARD_INDEX} stage=encode start" >&2
 "${PYTHON_BIN}" scripts/encode_pragma_c_records.py \
   --output_root "${WORK_ROOT}" \
   --shard_index "${SHARD_INDEX}" \
@@ -40,5 +42,11 @@ MAX_EVAL_POINTS_PER_ACCOUNT_CALIBRATION="${MAX_EVAL_POINTS_PER_ACCOUNT_CALIBRATI
   --max_eval_points_per_account_valid "${MAX_EVAL_POINTS_PER_ACCOUNT_VALID}" \
   --max_eval_points_per_account_calibration "${MAX_EVAL_POINTS_PER_ACCOUNT_CALIBRATION}"
 
-"${PYTHON_BIN}" scripts/build_pragma_c_manifest.py \
-  --output_root "${WORK_ROOT}"
+echo "[pragma_c_encode_wrapper] shard=${SHARD_INDEX} stage=manifest start" >&2
+mkdir -p "$(dirname "${MANIFEST_LOCK}")"
+(
+  flock 9
+  "${PYTHON_BIN}" scripts/build_pragma_c_manifest.py \
+    --output_root "${WORK_ROOT}"
+) 9>"${MANIFEST_LOCK}"
+echo "[pragma_c_encode_wrapper] shard=${SHARD_INDEX} stage=done" >&2

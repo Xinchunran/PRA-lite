@@ -9,6 +9,7 @@ from scripts.assign_pragma_c_splits import assign_splits
 from scripts.audit_pragma_c_graph import audit_graph
 from scripts.audit_pragma_c_leakage import audit_leakage
 from scripts.build_pragma_c_canonical_transactions import build_canonical_transactions
+from scripts.build_pragma_c_encode_index import build_encode_index
 from scripts.build_pragma_c_eval_points import build_eval_points
 from scripts.build_pragma_c_manifest import build_manifest
 from scripts.build_pragma_c_tokenizer import build_tokenizer
@@ -87,6 +88,13 @@ def test_pragma_c_minimal_pipeline_builds_isolated_dataset(tmp_path: Path) -> No
     eval_points_path = build_eval_points(output_root)
     assigned_eval_points_path = assign_splits(output_root)
     tokenizer_dir = build_tokenizer(output_root, profile_sample_limit=32, max_history_events=16)
+    encode_index_dir = build_encode_index(
+        output_root,
+        num_shards=1,
+        max_eval_points_per_account_train=4,
+        max_eval_points_per_account_valid=2,
+        max_eval_points_per_account_calibration=2,
+    )
     shard_dir = encode_shard(
         output_root,
         shard_index=0,
@@ -109,6 +117,7 @@ def test_pragma_c_minimal_pipeline_builds_isolated_dataset(tmp_path: Path) -> No
     assert eval_points_path.exists()
     assert assigned_eval_points_path.exists()
     assert tokenizer_dir.joinpath("tokenizer.json").exists()
+    assert encode_index_dir.joinpath("shard_00000.parquet").exists()
     assert shard_dir.joinpath("dataset.lmdb", "length.txt").exists()
     assert shard_dir.joinpath("train.lmdb", "length.txt").exists()
     assert shard_dir.joinpath("valid.lmdb", "length.txt").exists()

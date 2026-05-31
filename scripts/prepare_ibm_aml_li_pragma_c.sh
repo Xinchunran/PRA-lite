@@ -17,6 +17,10 @@ RAW_CSV="${RAW_CSV:-LI-Medium_Trans.csv}"
 WORK_ROOT="${WORK_ROOT:-data/streaming/ibm_aml_li_medium_pragma_c}"
 MAX_HISTORY_EVENTS="${MAX_HISTORY_EVENTS:-6500}"
 PROFILE_SAMPLE_LIMIT="${PROFILE_SAMPLE_LIMIT:-200000}"
+NUM_SHARDS="${NUM_SHARDS:-128}"
+MAX_EVAL_POINTS_PER_ACCOUNT_TRAIN="${MAX_EVAL_POINTS_PER_ACCOUNT_TRAIN:-64}"
+MAX_EVAL_POINTS_PER_ACCOUNT_VALID="${MAX_EVAL_POINTS_PER_ACCOUNT_VALID:-32}"
+MAX_EVAL_POINTS_PER_ACCOUNT_CALIBRATION="${MAX_EVAL_POINTS_PER_ACCOUNT_CALIBRATION:-32}"
 
 mkdir -p "${WORK_ROOT}"
 
@@ -41,3 +45,10 @@ mkdir -p "${WORK_ROOT}"
 
 "${PYTHON_BIN}" scripts/audit_pragma_c_graph.py \
   --output_root "${WORK_ROOT}"
+
+"${PYTHON_BIN}" scripts/build_pragma_c_encode_index.py \
+  --output_root "${WORK_ROOT}" \
+  --num_shards "${NUM_SHARDS}" \
+  --max_eval_points_per_account_train "${MAX_EVAL_POINTS_PER_ACCOUNT_TRAIN}" \
+  --max_eval_points_per_account_valid "${MAX_EVAL_POINTS_PER_ACCOUNT_VALID}" \
+  --max_eval_points_per_account_calibration "${MAX_EVAL_POINTS_PER_ACCOUNT_CALIBRATION}"

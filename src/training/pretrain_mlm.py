@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
+import src.model.pragma_lite.model as pragma_model_module
 from src.common.yaml_utils import load_yaml
 from src.model.pragma_lite.model import PragmaLiteConfig, PragmaLiteModel
 from src.tokenizer.masking import MaskedEventCollator
@@ -334,6 +335,118 @@ def _masked_accuracy_stats(logits: torch.Tensor, labels: torch.Tensor) -> tuple[
     return correct, count
 
 
+def _has_supervised_mlm_targets(labels: torch.Tensor) -> bool:
+    return bool(labels.ne(-100).any().item())
+
+
+def _supervised_target_rank_count(has_targets_local: bool, device: torch.device) -> int:
+    if not _is_distributed():
+        return int(has_targets_local)
+    stats = torch.tensor([int(has_targets_local)], dtype=torch.int64, device=device)
+    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    return int(stats.item())
+
+
+def _iter_ddp_stride_probe_parameters(model: nn.Module) -> list[tuple[str, nn.Parameter]]:
+    tracked: list[tuple[str, nn.Parameter]] = []
+    for name, param in _unwrap_model(model).named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.endswith(("profile_cls", "event_cls")):
+            tracked.append((name, param))
+            continue
+        if param.ndim == 3 and tuple(param.shape[:2]) == (1, 1):
+            tracked.append((name, param))
+    return tracked
+
+
+def _debug_tensor_layout(tensor: torch.Tensor | None) -> dict[str, object] | None:
+    if tensor is None:
+        return None
+    return {
+        "shape": list(tensor.shape),
+        "stride": list(tensor.stride()),
+        "is_contiguous": bool(tensor.is_contiguous()),
+        "storage_offset": int(tensor.storage_offset()),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+    }
+
+
+def _emit_ddp_stride_layout_snapshot(model: nn.Module, *, tag: str) -> None:
+    source_file = Path(str(pragma_model_module.__file__)).resolve()
+    try:
+        source_text = source_file.read_text(encoding="utf-8")
+    except Exception:
+        source_text = ""
+    for name, param in _iter_ddp_stride_probe_parameters(model):
+        _debug_event(
+            "ddp_param_layout_snapshot",
+            hypothesis_id="D",
+            location="src/training/pretrain_mlm.py:ddp_param_layout_snapshot",
+            msg="[DEBUG] DDP stride probe parameter snapshot",
+            tag=tag,
+            parameter=name,
+            param_layout=_debug_tensor_layout(param),
+            model_source_file=str(source_file),
+            model_source_mtime_ns=source_file.stat().st_mtime_ns if source_file.exists() else None,
+            profile_repeat_present="self.profile_cls.repeat(" in source_text,
+            event_repeat_present="self.event_cls.repeat(" in source_text,
+            local_rank=os.environ.get("LOCAL_RANK"),
+            world_size=os.environ.get("WORLD_SIZE"),
+        )
+
+
+def _register_ddp_stride_debug_hooks(model: nn.Module) -> None:
+    max_events = _env_int("DDP_STRIDE_DEBUG_MAX_EVENTS", 6)
+    hook_counts: dict[str, int] = {}
+    for name, param in _iter_ddp_stride_probe_parameters(model):
+        hook_counts[name] = 0
+
+        def _hook(grad: torch.Tensor, *, parameter_name: str = name, parameter: nn.Parameter = param) -> torch.Tensor:
+            mismatch = tuple(grad.stride()) != tuple(parameter.stride())
+            seen = hook_counts[parameter_name]
+            if not mismatch and seen >= max_events:
+                return grad
+            hook_counts[parameter_name] = seen + 1
+            _debug_event(
+                "ddp_grad_layout",
+                hypothesis_id="C" if mismatch else "E",
+                location="src/training/pretrain_mlm.py:ddp_grad_hook",
+                msg="[DEBUG] DDP grad layout observed",
+                parameter=parameter_name,
+                mismatch=mismatch,
+                grad_layout=_debug_tensor_layout(grad),
+                param_layout=_debug_tensor_layout(parameter),
+                observation_index=hook_counts[parameter_name],
+                local_rank=os.environ.get("LOCAL_RANK"),
+                world_size=os.environ.get("WORLD_SIZE"),
+            )
+            return grad
+
+        param.register_hook(_hook)
+
+
+def _emit_ddp_stride_grad_snapshot(model: nn.Module, *, step: int, epoch: int) -> None:
+    for name, param in _iter_ddp_stride_probe_parameters(model):
+        grad = param.grad
+        mismatch = grad is not None and tuple(grad.stride()) != tuple(param.stride())
+        _debug_event(
+            "ddp_grad_snapshot",
+            hypothesis_id="C" if mismatch else "E",
+            location="src/training/pretrain_mlm.py:ddp_grad_snapshot",
+            msg="[DEBUG] DDP grad snapshot after backward",
+            step=step,
+            epoch=epoch,
+            parameter=name,
+            mismatch=bool(mismatch),
+            grad_layout=_debug_tensor_layout(grad),
+            param_layout=_debug_tensor_layout(param),
+            local_rank=os.environ.get("LOCAL_RANK"),
+            world_size=os.environ.get("WORLD_SIZE"),
+        )
+
+
 def _grad_norm(model: nn.Module) -> float:
     total = 0.0
     for param in _unwrap_model(model).parameters():
@@ -404,6 +517,8 @@ def _evaluate(
                 }
             }
             mlm_labels = batch["mlm_labels"].to(device, non_blocking=True)
+            if not _has_supervised_mlm_targets(mlm_labels):
+                continue
             with _autocast_context(device, precision):
                 logits = model(**model_inputs, return_mlm_logits=True)
                 loss = loss_fn(logits.view(-1, logits.size(-1)), mlm_labels.view(-1))
@@ -492,6 +607,10 @@ def main() -> None:
     dataset_load_started = time.perf_counter()
     # #endregion
     model: nn.Module = PragmaLiteModel(cfg).to(device)
+    # #region debug-point C:ddp-stride-probe
+    _emit_ddp_stride_layout_snapshot(model, tag="before_ddp_wrap")
+    _register_ddp_stride_debug_hooks(model)
+    # #endregion
     if _is_distributed():
         model = DDP(
             model,
@@ -499,6 +618,9 @@ def main() -> None:
             output_device=local_rank,
             find_unused_parameters=True,
         )
+    # #region debug-point C:ddp-stride-probe
+    _emit_ddp_stride_layout_snapshot(model, tag="after_ddp_wrap")
+    # #endregion
 
     batch_size = _env_int("TRAIN_BATCH_SIZE", int(train_cfg["training"].get("batch_size", 32)))
     data_cfg = train_cfg.get("data", {})
@@ -722,6 +844,15 @@ def main() -> None:
                     }
                 }
                 mlm_labels = batch["mlm_labels"].to(device, non_blocking=True)
+                has_targets_local = _has_supervised_mlm_targets(mlm_labels)
+                supervised_rank_count = _supervised_target_rank_count(has_targets_local, device)
+                if supervised_rank_count == 0:
+                    if _rank() == 0:
+                        print(
+                            f"[metrics][train] step={step + 1} skipped=no_masked_targets "
+                            f"ready_shards={len(ready_train_shards)}"
+                        )
+                    continue
                 # #region debug-point B:h2d
                 h2d_s = time.perf_counter() - h2d_started_at
                 if step < 8:
@@ -744,7 +875,12 @@ def main() -> None:
                 # #endregion
                 with _autocast_context(device, precision):
                     logits = model(**model_inputs, return_mlm_logits=True)
-                    loss = loss_fn(logits.view(-1, logits.size(-1)), mlm_labels.view(-1))
+                    if has_targets_local:
+                        loss = loss_fn(logits.view(-1, logits.size(-1)), mlm_labels.view(-1))
+                    else:
+                        # Keep all ranks on the same DDP execution path when only a subset
+                        # of local batches contains masked MLM targets.
+                        loss = logits.sum() * 0.0
                 masked_correct, masked_count = _masked_accuracy_stats(logits, mlm_labels)
                 # #region debug-point B:forward
                 forward_s = time.perf_counter() - forward_started_at
@@ -760,6 +896,8 @@ def main() -> None:
                         forward_s=round(forward_s, 4),
                         loss=float(loss.item()),
                         masked_count=int(masked_count),
+                        has_targets_local=has_targets_local,
+                        supervised_rank_count=supervised_rank_count,
                     )
                 # #endregion
 
@@ -769,6 +907,10 @@ def main() -> None:
                 current_lr = float(optimizer.param_groups[0]["lr"])
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                if step < _env_int("DDP_STRIDE_DEBUG_STEPS", 4):
+                    # #region debug-point C:ddp-stride-probe
+                    _emit_ddp_stride_grad_snapshot(model, step=step + 1, epoch=epoch)
+                    # #endregion
                 grad_norm = _grad_norm(model)
                 # #region debug-point B:backward
                 backward_s = time.perf_counter() - backward_started_at

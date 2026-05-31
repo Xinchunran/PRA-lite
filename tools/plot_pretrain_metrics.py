@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -51,12 +52,39 @@ def _series(entries: list[dict[str, Any]], kind: str, metric: str) -> tuple[list
     return xs, ys
 
 
-def _single_plot(entries: list[dict[str, Any]], kind: str, metric: str, output_path: Path, title: str, ylabel: str) -> None:
+def _segmented_series(entries: list[dict[str, Any]], kind: str, metric: str) -> list[tuple[list[int], list[float]]]:
     xs, ys = _series(entries, kind, metric)
     if not xs:
+        return []
+
+    segments: list[tuple[list[int], list[float]]] = []
+    current_xs: list[int] = []
+    current_ys: list[float] = []
+    prev_x: int | None = None
+
+    for x, y in zip(xs, ys):
+        if not math.isfinite(y):
+            continue
+        if prev_x is not None and x <= prev_x and current_xs:
+            segments.append((current_xs, current_ys))
+            current_xs = []
+            current_ys = []
+        current_xs.append(x)
+        current_ys.append(y)
+        prev_x = x
+
+    if current_xs:
+        segments.append((current_xs, current_ys))
+    return segments
+
+
+def _single_plot(entries: list[dict[str, Any]], kind: str, metric: str, output_path: Path, title: str, ylabel: str) -> None:
+    segments = _segmented_series(entries, kind, metric)
+    if not segments:
         return
     plt.figure(figsize=(9.5, 4.8))
-    plt.plot(xs, ys, linewidth=1.3, color="#2563eb")
+    for xs, ys in segments:
+        plt.plot(xs, ys, linewidth=1.3, color="#2563eb")
     plt.xlabel("Step")
     plt.ylabel(ylabel)
     plt.title(title)
@@ -76,11 +104,12 @@ def _multi_kind_plot(
     plotted = False
     plt.figure(figsize=(10, 5))
     for kind, metric, label, color in metrics:
-        xs, ys = _series(entries, kind, metric)
-        if not xs:
+        segments = _segmented_series(entries, kind, metric)
+        if not segments:
             continue
         plotted = True
-        plt.plot(xs, ys, linewidth=1.2, label=label, color=color)
+        for idx, (xs, ys) in enumerate(segments):
+            plt.plot(xs, ys, linewidth=1.2, label=label if idx == 0 else None, color=color)
     if not plotted:
         plt.close()
         return
@@ -105,11 +134,12 @@ def _multi_plot(
     plotted = False
     plt.figure(figsize=(10, 5))
     for metric, label, color in metrics:
-        xs, ys = _series(entries, kind, metric)
-        if not xs:
+        segments = _segmented_series(entries, kind, metric)
+        if not segments:
             continue
         plotted = True
-        plt.plot(xs, ys, linewidth=1.2, label=label, color=color)
+        for idx, (xs, ys) in enumerate(segments):
+            plt.plot(xs, ys, linewidth=1.2, label=label if idx == 0 else None, color=color)
     if not plotted:
         plt.close()
         return
@@ -223,11 +253,10 @@ def generate_plots(entries: list[dict[str, Any]], output_dir: Path, title_prefix
         entries,
         [
             ("valid", "valid_masked_accuracy", "valid_masked_accuracy", "#2563eb"),
-            ("valid", "valid_perplexity", "valid_perplexity", "#dc2626"),
         ],
         output_dir / "validation_metrics.png",
-        f"{title_prefix} Validation Metrics",
-        "Metric",
+        f"{title_prefix} Validation Accuracy",
+        "Accuracy",
     )
     _multi_kind_plot(
         entries,

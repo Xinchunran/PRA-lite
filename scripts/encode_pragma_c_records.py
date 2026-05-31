@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.dataset as ds
 
 from src.common.fs import ensure_dir, write_json
 from src.common.tokenized_lmdb import TokenizedLmdbWriter
@@ -34,6 +36,88 @@ def _build_writers(out_dir: Path, map_size_gb: int, commit_interval: int) -> tup
     return dataset_writer, split_writers
 
 
+def _load_shard_eval(
+    output_root: Path,
+    *,
+    shard_index: int,
+    num_shards: int,
+    max_eval_points_per_account_train: int,
+    max_eval_points_per_account_valid: int,
+    max_eval_points_per_account_calibration: int,
+) -> pd.DataFrame:
+    shard_eval_path = output_root / "eval_points" / "encode_shards" / f"shard_{shard_index:05d}.parquet"
+    if shard_eval_path.exists():
+        shard_eval = pd.read_parquet(shard_eval_path)
+        shard_eval["evaluation_time"] = pd.to_datetime(shard_eval["evaluation_time"], utc=True, errors="coerce")
+        print(
+            f"[pragma_c_encode] shard={shard_index:05d} loaded pre-indexed eval points rows={len(shard_eval)} "
+            f"entities={shard_eval['entity_id'].nunique() if not shard_eval.empty else 0}",
+            flush=True,
+        )
+        return shard_eval
+
+    print(
+        f"[pragma_c_encode] shard={shard_index:05d} no pre-indexed eval file found, falling back to full eval scan",
+        flush=True,
+    )
+    eval_points = pd.read_parquet(output_root / "eval_points" / "eval_points.parquet")
+    eval_points["evaluation_time"] = pd.to_datetime(eval_points["evaluation_time"], utc=True, errors="coerce")
+    eval_points = eval_points[
+        (eval_points["task"] == "pretrain") & (eval_points["eval_source"].isin(PRETRAIN_EVAL_SOURCES))
+    ].copy()
+    split_caps = {
+        "train": max_eval_points_per_account_train,
+        "valid": max_eval_points_per_account_valid,
+        "calibration": max_eval_points_per_account_calibration,
+        "test": 0,
+        "embargo": 0,
+    }
+    eval_points = apply_split_caps(eval_points, split_caps)
+    eval_points["encode_shard_index"] = eval_points["entity_id"].map(lambda value: stable_hash_bucket(value, num_shards))
+    return eval_points[eval_points["encode_shard_index"] == int(shard_index)].copy()
+
+
+def _load_transactions_for_entities(output_root: Path, entity_ids: list[int]) -> pd.DataFrame:
+    tx_path = output_root / "canonical" / "transactions.parquet"
+    if not entity_ids:
+        return pd.DataFrame(
+            columns=[
+                "transaction_id",
+                "transaction_time",
+                "sender_entity_id",
+                "receiver_entity_id",
+                "from_bank",
+                "to_bank",
+                "amount_paid",
+                "amount_received",
+                "payment_currency",
+                "receiving_currency",
+                "payment_format",
+                "is_laundering",
+            ]
+        )
+
+    tx_columns = [
+        "transaction_id",
+        "transaction_time",
+        "sender_entity_id",
+        "receiver_entity_id",
+        "from_bank",
+        "to_bank",
+        "amount_paid",
+        "amount_received",
+        "payment_currency",
+        "receiving_currency",
+        "payment_format",
+        "is_laundering",
+    ]
+    entity_values = sorted({int(entity_id) for entity_id in entity_ids})
+    filter_expr = ds.field("sender_entity_id").isin(entity_values) | ds.field("receiver_entity_id").isin(entity_values)
+    tx = ds.dataset(tx_path).to_table(columns=tx_columns, filter=filter_expr).to_pandas()
+    tx["transaction_time"] = pd.to_datetime(tx["transaction_time"], utc=True, errors="coerce")
+    return tx
+
+
 def encode_shard(
     output_root: str | Path,
     *,
@@ -50,29 +134,31 @@ def encode_shard(
     lmdb_commit_interval: int,
 ) -> Path:
     output_root = Path(output_root)
+    started_at = time.perf_counter()
     out_dir = ensure_dir(output_root / "tokenized_shards" / f"shard_{shard_index:05d}")
     vocab = TokenizerVocab.load(output_root / "tokenizer")
-    tx = pd.read_parquet(output_root / "canonical" / "transactions.parquet")
-    eval_points = pd.read_parquet(output_root / "eval_points" / "eval_points.parquet")
-
-    tx["transaction_time"] = pd.to_datetime(tx["transaction_time"], utc=True, errors="coerce")
-    eval_points["evaluation_time"] = pd.to_datetime(eval_points["evaluation_time"], utc=True, errors="coerce")
-    eval_points = eval_points[
-        (eval_points["task"] == "pretrain") & (eval_points["eval_source"].isin(PRETRAIN_EVAL_SOURCES))
-    ].copy()
-
-    split_caps = {
-        "train": max_eval_points_per_account_train,
-        "valid": max_eval_points_per_account_valid,
-        "calibration": max_eval_points_per_account_calibration,
-        "test": 0,
-        "embargo": 0,
-    }
-    eval_points = apply_split_caps(eval_points, split_caps)
-    eval_points["encode_shard_index"] = eval_points["eval_id"].map(lambda value: stable_hash_bucket(value, num_shards))
-    shard_eval = eval_points[eval_points["encode_shard_index"] == int(shard_index)].copy()
-
+    print(f"[pragma_c_encode] shard={shard_index:05d} stage=load_eval", flush=True)
+    shard_eval = _load_shard_eval(
+        output_root,
+        shard_index=shard_index,
+        num_shards=num_shards,
+        max_eval_points_per_account_train=max_eval_points_per_account_train,
+        max_eval_points_per_account_valid=max_eval_points_per_account_valid,
+        max_eval_points_per_account_calibration=max_eval_points_per_account_calibration,
+    )
+    entity_ids = sorted({int(entity_id) for entity_id in shard_eval["entity_id"].unique().tolist()}) if not shard_eval.empty else []
+    print(
+        f"[pragma_c_encode] shard={shard_index:05d} stage=load_tx entities={len(entity_ids)} eval_rows={len(shard_eval)}",
+        flush=True,
+    )
+    tx = _load_transactions_for_entities(output_root, entity_ids)
+    print(
+        f"[pragma_c_encode] shard={shard_index:05d} stage=build_event_view tx_rows={len(tx)} elapsed_s={time.perf_counter() - started_at:.1f}",
+        flush=True,
+    )
     account_events = build_account_event_view(tx)
+    if entity_ids:
+        account_events = account_events[account_events["entity_id"].isin(entity_ids)].copy()
     event_groups = {int(entity_id): df.reset_index(drop=True) for entity_id, df in account_events.groupby("entity_id", sort=False)}
     cfg = StructuredRecordConfig(
         max_events=max_events,
@@ -85,9 +171,16 @@ def encode_shard(
     history_lengths: list[int] = []
     token_lengths: list[int] = []
     empty_histories = 0
+    progress_every = 10_000
 
     try:
-        for row in shard_eval.sort_values(["evaluation_time", "entity_id", "anchor_transaction_id"], kind="stable").itertuples(index=False):
+        ordered_eval = shard_eval.sort_values(["evaluation_time", "entity_id", "anchor_transaction_id"], kind="stable")
+        total_rows = len(ordered_eval)
+        print(
+            f"[pragma_c_encode] shard={shard_index:05d} stage=encode total_rows={total_rows} entities={len(event_groups)}",
+            flush=True,
+        )
+        for row_idx, row in enumerate(ordered_eval.itertuples(index=False), start=1):
             entity_events = event_groups.get(int(row.entity_id))
             if entity_events is None:
                 history = pd.DataFrame(columns=account_events.columns)
@@ -120,6 +213,12 @@ def encode_shard(
             token_lengths.append(int(sum(sum(mask_row) for mask_row in encoded["event_token_mask"])))
             if history_count == 0:
                 empty_histories += 1
+            if row_idx % progress_every == 0:
+                print(
+                    f"[pragma_c_encode] shard={shard_index:05d} progress={row_idx}/{total_rows} "
+                    f"elapsed_s={time.perf_counter() - started_at:.1f}",
+                    flush=True,
+                )
     finally:
         dataset_writer.close()
         for writer in split_writers.values():
@@ -142,6 +241,11 @@ def encode_shard(
         "empty_history_records": int(empty_histories),
     }
     write_json(out_dir / "shard_summary.json", summary)
+    print(
+        f"[pragma_c_encode] shard={shard_index:05d} stage=done records={summary['num_records']} "
+        f"elapsed_s={time.perf_counter() - started_at:.1f}",
+        flush=True,
+    )
     return out_dir
 
 

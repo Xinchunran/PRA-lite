@@ -9,5 +9,11 @@ training:
   num_workers: 0
   pin_memory: true
 
+dataloader:
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
 masking:
   token_mask_prob: 0.15

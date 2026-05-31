@@ -8,7 +8,7 @@ import pandas as pd
 
 from src.training import pretrain_mlm
 from tests.test_structured_data_pipeline import _write_tokenizer
-from tools.plot_pretrain_metrics import DEFAULT_PLOT_FILES, generate_plots, load_metrics
+from tools.plot_pretrain_metrics import DEFAULT_PLOT_FILES, _segmented_series, generate_plots, load_metrics
 
 
 def _write_metrics(metrics_path: Path) -> None:
@@ -92,6 +92,27 @@ def test_generate_plots_writes_train_and_validation_outputs(tmp_path: Path) -> N
 
     missing = [name for name in DEFAULT_PLOT_FILES if not (output_dir / name).exists()]
     assert missing == []
+
+
+def test_segmented_series_splits_on_step_reset(tmp_path: Path) -> None:
+    metrics_path = tmp_path / "metrics.jsonl"
+    metrics_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"kind": "train", "step": 1, "train_loss": 10.0}),
+                json.dumps({"kind": "train", "step": 2, "train_loss": 8.0}),
+                json.dumps({"kind": "train", "step": 1, "train_loss": 9.5}),
+                json.dumps({"kind": "train", "step": 2, "train_loss": 7.5}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    entries = load_metrics(metrics_path)
+    segments = _segmented_series(entries, "train", "train_loss")
+
+    assert segments == [([1, 2], [10.0, 8.0]), ([1, 2], [9.5, 7.5])]
 
 
 def test_pretrain_periodic_plotting_invokes_plot_writer(tmp_path: Path, monkeypatch) -> None:

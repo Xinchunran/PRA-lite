@@ -35,6 +35,12 @@ def _make_batch() -> dict[str, torch.Tensor]:
     }
 
 
+def _make_all_ignore_batch() -> dict[str, torch.Tensor]:
+    batch = _make_batch()
+    batch["mlm_labels"] = torch.full((1, 2, 2), -100, dtype=torch.long)
+    return batch
+
+
 def test_evaluate_reduces_validation_loss_across_ranks(monkeypatch) -> None:
     called = {"all_reduce": 0}
 
@@ -86,3 +92,41 @@ def test_evaluate_skips_all_reduce_outside_distributed(monkeypatch) -> None:
 
     assert float(valid_metrics["valid_loss"]) > 0.0
     assert float(valid_metrics["valid_masked_accuracy"]) >= 0.0
+
+
+def test_evaluate_skips_batches_without_supervised_targets(monkeypatch) -> None:
+    monkeypatch.setattr(pretrain_mlm, "_is_distributed", lambda: False)
+
+    model = _DummyModel(vocab_size=4)
+    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
+    valid_loader = [_make_all_ignore_batch()]
+
+    valid_metrics = pretrain_mlm._evaluate(
+        model=model,
+        valid_loader=valid_loader,  # type: ignore[arg-type]
+        loss_fn=loss_fn,
+        device=torch.device("cpu"),
+        precision="fp32",
+    )
+
+    assert valid_metrics["valid_batches"] == 0.0
+    assert valid_metrics["valid_loss"] == float("inf")
+    assert valid_metrics["valid_masked_accuracy"] == 0.0
+
+
+def test_supervised_target_rank_count_reduces_across_ranks(monkeypatch) -> None:
+    called = {"all_reduce": 0}
+
+    def fake_all_reduce(stats: torch.Tensor, op: object | None = None) -> None:
+        _ = op
+        called["all_reduce"] += 1
+        stats.fill_(1)
+
+    monkeypatch.setattr(pretrain_mlm, "_is_distributed", lambda: True)
+    monkeypatch.setattr(pretrain_mlm.dist, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(pretrain_mlm.dist, "ReduceOp", type("_ReduceOp", (), {"SUM": object()})())
+
+    reduced = pretrain_mlm._supervised_target_rank_count(False, torch.device("cpu"))
+
+    assert called["all_reduce"] == 1
+    assert reduced == 1

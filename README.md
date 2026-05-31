@@ -192,6 +192,14 @@ When Stage C is launched through `scripts/run_ibm_aml_li_medium_pragma_c_pretrai
 runs/pretrain_ibm_aml_li_medium_pragma_c/
 ```
 
+### Stage C Training Notes
+
+- Stage C shards can contain batches where some DDP ranks have no masked MLM targets. The trainer now keeps all ranks on the same backward path by using a zero loss on target-free ranks instead of letting those ranks `continue`.
+- Because of that safeguard, you may occasionally see `train_loss=-0.0000` in `train.log`. This is expected for the local rank on that step and does not mean the whole global step is invalid.
+- A step is only fully skipped when **all** ranks have no supervised MLM targets. In that case the log prints `skipped=no_masked_targets`.
+- Older Stage C runs may still contain `Grad strides do not match bucket view strides` warnings near the top of `train.log`. The current model code canonicalizes the grad layout for the learnable CLS tokens, so check the most recent launch block before assuming the warning is still active.
+- If `train.log` contains multiple restarts, read it by launch block rather than assuming one continuous run. The newest run begins at the latest `Using TORCHRUN_BIN=...` line.
+
 ## Notes
 
 - `--split all` runs on the full tokenized dataset without split filtering.

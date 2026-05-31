@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from src.model.pragma_lite import PragmaLiteModel
+from src.model.pragma_lite.model import _canonicalize_grad_layout
 
 
 def _make_model() -> PragmaLiteModel:
@@ -116,3 +117,13 @@ def test_mlm_event_context_comes_from_history_encoder_not_pre_history_pooling() 
 
     assert logits_from_history.shape == logits_from_pre_history.shape
     assert not torch.allclose(logits_from_history, logits_from_pre_history, atol=1e-6)
+
+
+def test_canonicalize_grad_layout_rewrites_singleton_stride_to_match_parameter() -> None:
+    reference = torch.zeros((1, 1, 32), dtype=torch.float32)
+    grad = torch.empty_strided((1, 1, 32), (96, 32, 1), dtype=torch.float32)
+    fixed = _canonicalize_grad_layout(grad, reference)
+
+    assert tuple(grad.stride()) == (96, 32, 1)
+    assert tuple(reference.stride()) == (32, 32, 1)
+    assert tuple(fixed.stride()) == tuple(reference.stride())

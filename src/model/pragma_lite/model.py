@@ -186,6 +186,14 @@ class KeyValueEmbedding(nn.Module):
         return self.dropout(hidden)
 
 
+def _canonicalize_grad_layout(grad: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    if tuple(grad.shape) != tuple(reference.shape) or tuple(grad.stride()) == tuple(reference.stride()):
+        return grad
+    aligned = torch.empty_like(reference)
+    aligned.copy_(grad)
+    return aligned
+
+
 class PragmaLiteModel(nn.Module):
     def __init__(self, config: object | None = None, **kwargs: Any) -> None:
         super().__init__()
@@ -259,6 +267,8 @@ class PragmaLiteModel(nn.Module):
         self.cls_head = nn.Linear(self.d_model, 1)
         nn.init.normal_(self.profile_cls, std=0.02)
         nn.init.normal_(self.event_cls, std=0.02)
+        self.profile_cls.register_hook(lambda grad: _canonicalize_grad_layout(grad, self.profile_cls))
+        self.event_cls.register_hook(lambda grad: _canonicalize_grad_layout(grad, self.event_cls))
 
     def _prepend_positions(self, values: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor | None:
         if values is None:
@@ -278,7 +288,7 @@ class PragmaLiteModel(nn.Module):
         token_hidden = self.kv_embedding(profile_key_ids, profile_value_ids, profile_value_pos)
         if profile_time is not None:
             token_hidden = token_hidden + self.time_proj(profile_time.unsqueeze(-1).to(token_hidden.dtype))
-        cls_token = self.profile_cls.expand(batch_size, -1, -1)
+        cls_token = self.profile_cls.repeat(batch_size, 1, 1)
         hidden = torch.cat([cls_token, token_hidden], dim=1)
         if profile_mask is None:
             mask = torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device)
@@ -301,7 +311,7 @@ class PragmaLiteModel(nn.Module):
             return event_key_ids.new_zeros((batch_size, 0, self.d_model), dtype=torch.float32)
         token_hidden = self.kv_embedding(event_key_ids, event_value_ids, event_value_pos)
         flat_hidden = token_hidden.view(batch_size * num_events, num_tokens, self.d_model)
-        flat_cls = self.event_cls.expand(batch_size * num_events, -1, -1)
+        flat_cls = self.event_cls.repeat(batch_size * num_events, 1, 1)
         flat_hidden = torch.cat([flat_cls, flat_hidden], dim=1)
         flat_mask = torch.cat(
             [
@@ -330,7 +340,7 @@ class PragmaLiteModel(nn.Module):
             return empty_hidden, empty_embed
         token_hidden = self.kv_embedding(event_key_ids, event_value_ids, event_value_pos)
         flat_hidden = token_hidden.view(batch_size * num_events, num_tokens, self.d_model)
-        flat_cls = self.event_cls.expand(batch_size * num_events, -1, -1)
+        flat_cls = self.event_cls.repeat(batch_size * num_events, 1, 1)
         flat_hidden = torch.cat([flat_cls, flat_hidden], dim=1)
         flat_mask = torch.cat(
             [
