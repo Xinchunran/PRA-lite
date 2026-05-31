@@ -16,7 +16,7 @@ This table compares the original [PRAGMA paper (arXiv:2604.08649)](https://arxiv
 | | Key-value-time representation with fused history context | ☑️ | ☑️ |
 | | Shared key/value embedding table | ☑️ | ☑️ |
 | | Learnable `[USR]` / `[EVT]` sequence prefix tokens | ☑️ | ☑️ |
-| | `[USR]` / `[EVT]` taken directly from shared token table | ☑️ | ✖️ |
+| | `[USR]` / `[EVT]` taken directly from shared token table | ☑️ | ☑️ |
 | | MLM logits matched against shared embedding table | ☑️ | ☑️ |
 | **Data Processing** | Key-Value-Time Tokenisation | ☑️ | ☑️ |
 | | Numeric Percentile Bucketing | ☑️ | ☑️ |
@@ -216,6 +216,7 @@ data/streaming/ibm_aml_li_medium_pragma_lite_full/
 - The current tokenizer now uses `tokenizer_version=2`, which stores `field_value_types`, `categorical_values`, `max_value_tokens_per_field`, and optional text tokenizer metadata in `tokenizer.json`.
 - Structured encoding now routes fields by type: numeric fields use bucket tokens with an optional `#ZERO` bucket, categorical fields use field-specific `[UNK]`, and textual fields can expand to multiple shared `T:*` tokens.
 - Multi-value fields now replicate the field key and increment `value_pos` as `0, 1, 2, ...`, which activates the existing within-field positional embedding path in the model.
+- The model now prepends `[USR]` and `[EVT]` by reading them directly from the shared token embedding table instead of maintaining separate learned CLS parameters.
 - The model now uses a two-layer calendar projection MLP and can tie MLM logits to the shared token embedding table, which is closer to PRAGMA Figure 4 without changing the Stage C split semantics.
 - Because `tokenizer_version=2` changes token ids and sequence layouts, new tokenized shards must be rebuilt under the leakage-prevent data root before running a clean comparison against older runs.
 

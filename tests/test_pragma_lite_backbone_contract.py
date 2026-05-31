@@ -92,6 +92,22 @@ def test_history_event_hidden_changes_when_event_order_changes() -> None:
     assert not torch.allclose(base, changed, atol=1e-6)
 
 
+def test_usr_evt_prefix_tokens_come_from_shared_embedding_table() -> None:
+    model = _make_model()
+    with torch.no_grad():
+        model.kv_embedding.token_emb.weight.zero_()
+        model.kv_embedding.token_emb.weight[model.usr_token_id].fill_(1.25)
+        model.kv_embedding.token_emb.weight[model.evt_token_id].fill_(-0.75)
+
+    usr = model._shared_special_token_embedding(model.usr_token_id, batch_size=2)
+    evt = model._shared_special_token_embedding(model.evt_token_id, batch_size=3)
+
+    assert usr.shape == (2, 1, model.d_model)
+    assert evt.shape == (3, 1, model.d_model)
+    assert torch.allclose(usr, torch.full_like(usr, 1.25))
+    assert torch.allclose(evt, torch.full_like(evt, -0.75))
+
+
 def test_mlm_event_context_comes_from_history_encoder_not_pre_history_pooling() -> None:
     model = _make_model()
     batch = _make_batch()

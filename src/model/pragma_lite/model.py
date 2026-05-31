@@ -7,6 +7,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from src.tokenizer.vocab import SPECIAL_TOKENS
+
 
 @dataclass
 class PragmaLiteConfig:
@@ -221,6 +223,8 @@ class PragmaLiteModel(nn.Module):
         self.max_profile_tokens = cfg.max_profile_tokens
         self.max_event_tokens = cfg.max_event_tokens
         self.max_events = cfg.max_events
+        self.usr_token_id = SPECIAL_TOKENS.index("[USR]")
+        self.evt_token_id = SPECIAL_TOKENS.index("[EVT]")
 
         self.kv_embedding = KeyValueEmbedding(
             vocab_size=self.vocab_size,
@@ -228,8 +232,6 @@ class PragmaLiteModel(nn.Module):
             max_value_pos=max(cfg.max_profile_tokens, cfg.max_event_tokens) + 1,
             dropout=cfg.dropout,
         )
-        self.profile_cls = nn.Parameter(torch.zeros(1, 1, self.d_model))
-        self.event_cls = nn.Parameter(torch.zeros(1, 1, self.d_model))
         self.profile_encoder = PragmaEncoder(
             num_layers=cfg.profile_layers,
             d_model=self.d_model,
@@ -281,10 +283,15 @@ class PragmaLiteModel(nn.Module):
         self.mlm_bias = nn.Parameter(torch.zeros(self.vocab_size)) if cfg.tie_mlm_to_embedding else None
         self.mlm_out = None if cfg.tie_mlm_to_embedding else nn.Linear(self.d_model, self.vocab_size)
         self.cls_head = nn.Linear(self.d_model, 1)
-        nn.init.normal_(self.profile_cls, std=0.02)
-        nn.init.normal_(self.event_cls, std=0.02)
-        self.profile_cls.register_hook(lambda grad: _canonicalize_grad_layout(grad, self.profile_cls))
-        self.event_cls.register_hook(lambda grad: _canonicalize_grad_layout(grad, self.event_cls))
+
+    def _shared_special_token_embedding(self, token_id: int, batch_size: int) -> torch.Tensor:
+        token_ids = torch.full(
+            (batch_size, 1),
+            int(token_id),
+            dtype=torch.long,
+            device=self.kv_embedding.token_emb.weight.device,
+        )
+        return self.kv_embedding.token_emb(token_ids)
 
     def _prepend_positions(self, values: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor | None:
         if values is None:
@@ -304,7 +311,7 @@ class PragmaLiteModel(nn.Module):
         token_hidden = self.kv_embedding(profile_key_ids, profile_value_ids, profile_value_pos)
         if profile_time is not None:
             token_hidden = token_hidden + self.time_proj(profile_time.unsqueeze(-1).to(token_hidden.dtype))
-        cls_token = self.profile_cls.repeat(batch_size, 1, 1)
+        cls_token = self._shared_special_token_embedding(self.usr_token_id, batch_size).to(token_hidden.dtype)
         hidden = torch.cat([cls_token, token_hidden], dim=1)
         if profile_mask is None:
             mask = torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device)
@@ -327,7 +334,7 @@ class PragmaLiteModel(nn.Module):
             return event_key_ids.new_zeros((batch_size, 0, self.d_model), dtype=torch.float32)
         token_hidden = self.kv_embedding(event_key_ids, event_value_ids, event_value_pos)
         flat_hidden = token_hidden.view(batch_size * num_events, num_tokens, self.d_model)
-        flat_cls = self.event_cls.repeat(batch_size * num_events, 1, 1)
+        flat_cls = self._shared_special_token_embedding(self.evt_token_id, batch_size * num_events).to(token_hidden.dtype)
         flat_hidden = torch.cat([flat_cls, flat_hidden], dim=1)
         flat_mask = torch.cat(
             [
@@ -356,7 +363,7 @@ class PragmaLiteModel(nn.Module):
             return empty_hidden, empty_embed
         token_hidden = self.kv_embedding(event_key_ids, event_value_ids, event_value_pos)
         flat_hidden = token_hidden.view(batch_size * num_events, num_tokens, self.d_model)
-        flat_cls = self.event_cls.repeat(batch_size * num_events, 1, 1)
+        flat_cls = self._shared_special_token_embedding(self.evt_token_id, batch_size * num_events).to(token_hidden.dtype)
         flat_hidden = torch.cat([flat_cls, flat_hidden], dim=1)
         flat_mask = torch.cat(
             [
