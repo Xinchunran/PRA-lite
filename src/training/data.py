@@ -475,14 +475,39 @@ def _trim_stacked_batch(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tenso
     for key in profile_keys:
         batch[key] = batch[key][:, :profile_keep]
 
-    event_axis_keys = ("event_key_ids", "event_value_ids", "event_value_pos", "event_token_mask", "event_time", "calendar_features", "event_mask", "mlm_labels", "unk_mask")
+    event_axis_keys = (
+        "event_key_ids",
+        "event_value_ids",
+        "event_value_pos",
+        "event_token_mask",
+        "event_time",
+        "calendar_features",
+        "event_mask",
+        "mlm_labels",
+        "mlm_value_type_ids",
+        "mlm_source_token_mask",
+        "mlm_source_key_mask",
+        "mlm_source_event_mask",
+        "unk_mask",
+    )
     for key in event_axis_keys:
         if key in batch:
             batch[key] = batch[key][:, :event_keep]
 
     if event_keep > 0:
         event_token_keep = int(batch["event_token_mask"].sum(dim=-1).max().item()) if batch["event_token_mask"].numel() > 0 else 0
-        event_token_keys = ("event_key_ids", "event_value_ids", "event_value_pos", "event_token_mask", "mlm_labels", "unk_mask")
+        event_token_keys = (
+            "event_key_ids",
+            "event_value_ids",
+            "event_value_pos",
+            "event_token_mask",
+            "mlm_labels",
+            "mlm_value_type_ids",
+            "mlm_source_token_mask",
+            "mlm_source_key_mask",
+            "mlm_source_event_mask",
+            "unk_mask",
+        )
         for key in event_token_keys:
             if key in batch:
                 batch[key] = batch[key][:, :, :event_token_keep]

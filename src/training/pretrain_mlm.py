@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from contextlib import nullcontext
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 import urllib.request
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -379,6 +382,82 @@ def _masked_accuracy_stats(logits: torch.Tensor, labels: torch.Tensor) -> tuple[
     return correct, count
 
 
+VALUE_TYPE_NAMES = {
+    0: "categorical",
+    1: "numerical",
+    2: "text",
+    3: "special",
+}
+
+
+class _MeanMetricAccumulator:
+    def __init__(self) -> None:
+        self.sum = defaultdict(float)
+        self.count = defaultdict(float)
+
+    def add(self, name: str, value_sum: float, count: int | float) -> None:
+        if count <= 0:
+            return
+        self.sum[name] += float(value_sum)
+        self.count[name] += float(count)
+
+    def finalize(self) -> dict[str, float]:
+        return {
+            name: self.sum[name] / max(self.count[name], 1.0)
+            for name in sorted(self.sum.keys())
+        }
+
+
+def _metric_slug(raw: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
+
+
+def _value_type_id(value_type: str) -> int:
+    normalized = str(value_type).strip().lower()
+    if normalized == "numeric":
+        return 1
+    if normalized in {"text", "textual", "text_bpe"}:
+        return 2
+    if normalized == "special":
+        return 3
+    return 0
+
+
+def _build_validation_metric_metadata(
+    vocab: TokenizerVocab,
+) -> tuple[torch.Tensor, torch.Tensor, dict[int, str], tuple[int, ...]]:
+    vocab_size = len(vocab.token_to_id)
+    key_id_to_value_type_id = torch.full((vocab_size,), 3, dtype=torch.long)
+    token_id_to_numeric_bucket = torch.full((vocab_size,), -1, dtype=torch.long)
+    key_id_to_metric_name: dict[int, str] = {}
+
+    for token, token_id in vocab.token_to_id.items():
+        if token.startswith("K:"):
+            field_key = token[2:]
+            field_value_type = vocab.field_value_types.get(
+                field_key,
+                "numeric" if field_key in vocab.numeric_binners else "categorical",
+            )
+            key_id_to_value_type_id[token_id] = _value_type_id(field_value_type)
+            key_id_to_metric_name[token_id] = _metric_slug(field_key)
+            continue
+        if token.startswith("V:") and token.endswith("#ZERO"):
+            token_id_to_numeric_bucket[token_id] = 0
+            continue
+        match = re.search(r"#B(\d+)$", token)
+        if token.startswith("V:") and match:
+            token_id_to_numeric_bucket[token_id] = int(match.group(1))
+
+    special_token_ids = (
+        vocab.pad_id,
+        vocab.unk_id,
+        vocab.mask_id,
+        vocab.usr_id,
+        vocab.evt_id,
+    )
+    return key_id_to_value_type_id, token_id_to_numeric_bucket, key_id_to_metric_name, special_token_ids
+
+
 def _has_supervised_mlm_targets(labels: torch.Tensor) -> bool:
     return bool(labels.ne(-100).any().item())
 
@@ -532,11 +611,12 @@ def _evaluate(
     device: torch.device,
     precision: str,
     max_batches: int | None = None,
+    token_id_to_numeric_bucket: torch.Tensor | None = None,
+    key_id_to_metric_name: dict[int, str] | None = None,
 ) -> dict[str, float]:
-    total_loss = 0.0
+    del loss_fn
+    metric_accumulator = _MeanMetricAccumulator()
     total_batches = 0
-    total_masked_correct = 0.0
-    total_masked_count = 0.0
     with torch.no_grad():
         for batch in valid_loader:
             if max_batches is not None and total_batches >= max_batches:
@@ -565,31 +645,160 @@ def _evaluate(
                 continue
             with _autocast_context(device, precision):
                 logits = model(**model_inputs, return_mlm_logits=True)
-                loss = loss_fn(logits.reshape(-1, logits.size(-1)), mlm_labels.reshape(-1))
-            total_loss += float(loss.item())
             total_batches += 1
-            masked_correct, masked_count = _masked_accuracy_stats(logits, mlm_labels)
-            total_masked_correct += float(masked_correct)
-            total_masked_count += float(masked_count)
+            flat_logits = logits.reshape(-1, logits.size(-1))
+            flat_labels = mlm_labels.reshape(-1)
+            valid_mask = flat_labels.ne(-100)
+            if not bool(valid_mask.any().item()):
+                continue
+
+            masked_logits = flat_logits[valid_mask]
+            masked_labels = flat_labels[valid_mask]
+            per_token_loss = F.cross_entropy(masked_logits, masked_labels, reduction="none")
+            preds = masked_logits.argmax(dim=-1)
+            correct = preds.eq(masked_labels)
+            masked_count = int(masked_labels.numel())
+
+            metric_accumulator.add("valid_loss", float(per_token_loss.sum().item()), masked_count)
+            metric_accumulator.add("valid_loss_overall", float(per_token_loss.sum().item()), masked_count)
+            metric_accumulator.add("valid_acc_overall", float(correct.float().sum().item()), masked_count)
+            metric_accumulator.add("valid_top1_acc", float(correct.float().sum().item()), masked_count)
+
+            topk = min(5, masked_logits.size(-1))
+            top5_correct = masked_logits.topk(topk, dim=-1).indices.eq(masked_labels.unsqueeze(1)).any(dim=1)
+            metric_accumulator.add("valid_top5_acc", float(top5_correct.float().sum().item()), masked_count)
+
+            event_key_ids = batch["event_key_ids"].to(device, non_blocking=True).reshape(-1)[valid_mask]
+            if key_id_to_metric_name:
+                for key_id in event_key_ids.unique().tolist():
+                    metric_name = key_id_to_metric_name.get(int(key_id))
+                    if not metric_name:
+                        continue
+                    key_mask = event_key_ids.eq(int(key_id))
+                    key_count = int(key_mask.sum().item())
+                    metric_accumulator.add(
+                        f"valid_acc_by_key_{metric_name}",
+                        float(correct[key_mask].float().sum().item()),
+                        key_count,
+                    )
+                    metric_accumulator.add(
+                        f"valid_loss_by_key_{metric_name}",
+                        float(per_token_loss[key_mask].sum().item()),
+                        key_count,
+                    )
+
+            value_type_tensor = batch.get("mlm_value_type_ids")
+            masked_value_type_ids: torch.Tensor | None = None
+            if value_type_tensor is not None:
+                masked_value_type_ids = value_type_tensor.to(device, non_blocking=True).reshape(-1)[valid_mask]
+                for value_type_id, value_type_name in VALUE_TYPE_NAMES.items():
+                    type_mask = masked_value_type_ids.eq(value_type_id)
+                    type_count = int(type_mask.sum().item())
+                    if type_count == 0:
+                        continue
+                    metric_accumulator.add(
+                        f"valid_acc_{value_type_name}",
+                        float(correct[type_mask].float().sum().item()),
+                        type_count,
+                    )
+                    metric_accumulator.add(
+                        f"valid_loss_{value_type_name}",
+                        float(per_token_loss[type_mask].sum().item()),
+                        type_count,
+                    )
+
+            source_fields = {
+                "token": batch.get("mlm_source_token_mask"),
+                "key": batch.get("mlm_source_key_mask"),
+                "event": batch.get("mlm_source_event_mask"),
+            }
+            for source_name, source_tensor in source_fields.items():
+                if source_tensor is None:
+                    continue
+                source_mask = source_tensor.to(device, non_blocking=True).reshape(-1)[valid_mask].bool()
+                source_count = int(source_mask.sum().item())
+                if source_count == 0:
+                    continue
+                metric_accumulator.add(
+                    f"valid_acc_{source_name}_mask",
+                    float(correct[source_mask].float().sum().item()),
+                    source_count,
+                )
+                metric_accumulator.add(
+                    f"valid_loss_{source_name}_mask",
+                    float(per_token_loss[source_mask].sum().item()),
+                    source_count,
+                )
+
+            if token_id_to_numeric_bucket is not None and masked_value_type_ids is not None:
+                numeric_lookup = token_id_to_numeric_bucket.to(device=device, non_blocking=True)
+                pred_bucket = numeric_lookup[preds]
+                true_bucket = numeric_lookup[masked_labels]
+                numeric_mask = masked_value_type_ids.eq(1) & pred_bucket.ge(0) & true_bucket.ge(0)
+                numeric_count = int(numeric_mask.sum().item())
+                if numeric_count > 0:
+                    abs_err = (pred_bucket[numeric_mask] - true_bucket[numeric_mask]).abs().float()
+                    metric_accumulator.add("valid_num_bucket_mae", float(abs_err.sum().item()), numeric_count)
+                    metric_accumulator.add(
+                        "valid_num_within_1_acc",
+                        float(abs_err.le(1).float().sum().item()),
+                        numeric_count,
+                    )
+                    metric_accumulator.add(
+                        "valid_num_within_2_acc",
+                        float(abs_err.le(2).float().sum().item()),
+                        numeric_count,
+                    )
+
+    reduced_metrics = metric_accumulator.finalize()
     if _is_distributed():
-        stats = torch.tensor(
-            [total_loss, float(total_batches), total_masked_correct, total_masked_count],
-            dtype=torch.float64,
-            device=device,
-        )
+        metric_names = sorted(set(metric_accumulator.sum.keys()) | set(metric_accumulator.count.keys()))
+        packed_stats: list[float] = []
+        for metric_name in metric_names:
+            packed_stats.append(float(metric_accumulator.sum.get(metric_name, 0.0)))
+            packed_stats.append(float(metric_accumulator.count.get(metric_name, 0.0)))
+        packed_stats.append(float(total_batches))
+        stats = torch.tensor(packed_stats, dtype=torch.float64, device=device)
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-        total_loss = float(stats[0].item())
-        total_batches = int(stats[1].item())
-        total_masked_correct = float(stats[2].item())
-        total_masked_count = float(stats[3].item())
-    valid_loss = total_loss / max(total_batches, 1) if total_batches else float("inf")
-    valid_masked_accuracy = total_masked_correct / max(total_masked_count, 1.0)
+        metric_accumulator = _MeanMetricAccumulator()
+        offset = 0
+        for metric_name in metric_names:
+            metric_accumulator.sum[metric_name] = float(stats[offset].item())
+            metric_accumulator.count[metric_name] = float(stats[offset + 1].item())
+            offset += 2
+        reduced_metrics = metric_accumulator.finalize()
+        total_batches = int(stats[offset].item())
+
+    valid_loss = float(reduced_metrics.get("valid_loss", float("inf"))) if total_batches else float("inf")
+    valid_masked_accuracy = float(reduced_metrics.get("valid_acc_overall", 0.0))
     valid_perplexity = float(math.exp(min(valid_loss, 20.0))) if math.isfinite(valid_loss) else float("inf")
+    reduced_metrics.update(
+        {
+            "valid_loss": valid_loss,
+            "valid_loss_overall": float(reduced_metrics.get("valid_loss_overall", valid_loss)),
+            "valid_masked_accuracy": valid_masked_accuracy,
+            "valid_top1_acc": float(reduced_metrics.get("valid_top1_acc", valid_masked_accuracy)),
+            "valid_perplexity": valid_perplexity,
+            "valid_batches": float(total_batches),
+        }
+    )
+    if "valid_acc_text" in reduced_metrics:
+        reduced_metrics.setdefault("valid_acc_text_bpe", float(reduced_metrics["valid_acc_text"]))
+    if "valid_loss_text" in reduced_metrics:
+        reduced_metrics.setdefault("valid_loss_text_bpe", float(reduced_metrics["valid_loss_text"]))
+    if total_batches == 0:
+        return {
+            "valid_loss": float("inf"),
+            "valid_loss_overall": float("inf"),
+            "valid_masked_accuracy": 0.0,
+            "valid_top1_acc": 0.0,
+            "valid_top5_acc": 0.0,
+            "valid_perplexity": float("inf"),
+            "valid_batches": 0.0,
+        }
     return {
-        "valid_loss": valid_loss,
-        "valid_masked_accuracy": valid_masked_accuracy,
-        "valid_perplexity": valid_perplexity,
-        "valid_batches": float(total_batches),
+        key: float(value) if isinstance(value, (int, float)) else value
+        for key, value in reduced_metrics.items()
     }
 
 
@@ -644,6 +853,12 @@ def main() -> None:
     else:
         tokenizer_dir = _guess_tokenizer_dir(data_dir)
     vocab = TokenizerVocab.load(tokenizer_dir)
+    (
+        key_id_to_value_type_id,
+        token_id_to_numeric_bucket,
+        key_id_to_metric_name,
+        special_token_ids,
+    ) = _build_validation_metric_metadata(vocab)
 
     cfg = PragmaLiteConfig(
         vocab_size=len(vocab.token_to_id),
@@ -730,6 +945,8 @@ def main() -> None:
         mask_token_id=vocab.mask_id,
         unk_token_id=vocab.unk_id,
         pad_token_id=vocab.pad_id,
+        key_id_to_value_type_id=key_id_to_value_type_id.cpu().numpy(),
+        special_token_ids=special_token_ids,
         token_mask_probability=float(masking_cfg.get("token_mask_prob", 0.15)),
         event_mask_probability=float(masking_cfg.get("event_mask_prob", 0.10)),
         key_mask_probability=float(masking_cfg.get("key_mask_prob", 0.10)),
@@ -740,6 +957,8 @@ def main() -> None:
         mask_token_id=vocab.mask_id,
         unk_token_id=vocab.unk_id,
         pad_token_id=vocab.pad_id,
+        key_id_to_value_type_id=key_id_to_value_type_id.cpu().numpy(),
+        special_token_ids=special_token_ids,
         token_mask_probability=float(masking_cfg.get("token_mask_prob", 0.15)),
         event_mask_probability=float(masking_cfg.get("event_mask_prob", 0.10)),
         key_mask_probability=float(masking_cfg.get("key_mask_prob", 0.10)),
@@ -1208,6 +1427,8 @@ def main() -> None:
                         device=device,
                         precision=precision,
                         max_batches=eval_max_batches,
+                        token_id_to_numeric_bucket=token_id_to_numeric_bucket,
+                        key_id_to_metric_name=key_id_to_metric_name,
                     )
                     valid_loss = float(valid_metrics["valid_loss"])
                     _debug_event(
@@ -1242,13 +1463,16 @@ def main() -> None:
                             "step": step + 1,
                             "epoch": epoch,
                             "eval_mode": eval_mode,
-                            "valid_loss": valid_loss,
-                            "valid_masked_accuracy": float(valid_metrics["valid_masked_accuracy"]),
-                            "valid_perplexity": float(valid_metrics["valid_perplexity"]),
-                            "valid_batches": int(valid_metrics["valid_batches"]),
                             "best_valid_loss": best_valid,
                             "num_ready_shards": _count_ready_shards(manifest_path),
                         }
+                        eval_record.update(
+                            {
+                                key: (int(value) if key == "valid_batches" else float(value))
+                                for key, value in valid_metrics.items()
+                                if key.startswith("valid_")
+                            }
+                        )
                         _append_metrics(metrics_path, eval_record)
                         if plot_every > 0 and (step + 1) % plot_every == 0:
                             _maybe_generate_plots(metrics_path, plots_dir, plot_title_prefix)
@@ -1270,6 +1494,10 @@ def main() -> None:
                             f"mode={eval_mode} "
                             f"step={step + 1} valid_loss={valid_loss:.4f} "
                             f"valid_masked_acc={float(valid_metrics['valid_masked_accuracy']):.4f} "
+                            f"top5={float(valid_metrics.get('valid_top5_acc', 0.0)):.4f} "
+                            f"cat={float(valid_metrics.get('valid_acc_categorical', 0.0)):.4f} "
+                            f"num={float(valid_metrics.get('valid_acc_numerical', 0.0)):.4f} "
+                            f"text={float(valid_metrics.get('valid_acc_text', 0.0)):.4f} "
                             f"valid_ppl={float(valid_metrics['valid_perplexity']):.4f} "
                             f"batches={int(valid_metrics['valid_batches'])} "
                             f"best_valid={best_valid:.4f}",

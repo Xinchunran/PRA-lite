@@ -9,7 +9,7 @@ training:
   seed: 42
   log_every: 100
   valid_every: 1000
-  full_valid_every: 5000
+  full_valid_every: 10000
   max_valid_batches: 64
   plot_every: 5000
   num_workers: 8
