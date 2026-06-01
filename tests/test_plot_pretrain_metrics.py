@@ -210,3 +210,97 @@ def test_pretrain_periodic_plotting_invokes_plot_writer(tmp_path: Path, monkeypa
     assert calls[0][0] == output_dir / "metrics.jsonl"
     assert calls[0][1] == plots_dir
     assert calls[0][2] == "UnitTest"
+
+
+def test_quick_validation_writes_stratified_metrics_to_jsonl(tmp_path: Path, monkeypatch) -> None:
+    tokenized_dir = tmp_path / "tokenized"
+    tokenizer_dir = tmp_path / "tokenizer"
+    split_dir = tmp_path / "splits"
+    config_dir = tmp_path / "configs"
+    output_dir = tmp_path / "runs"
+    tokenized_dir.mkdir()
+    tokenizer_dir.mkdir()
+    split_dir.mkdir()
+    config_dir.mkdir()
+    _write_tokenizer(tokenizer_dir)
+    _write_tokenized_splits(tokenized_dir)
+
+    train_cfg = config_dir / "pretrain_quick_valid.yaml"
+    train_cfg.write_text(
+        "\n".join(
+            [
+                "training:",
+                "  batch_size: 2",
+                "  max_steps: 1",
+                "  learning_rate: 1.0e-4",
+                "  weight_decay: 0.0",
+                "  seed: 7",
+                "  log_every: 1",
+                "  valid_every: 1",
+                "  full_valid_every: 10",
+                "  max_valid_batches: 1",
+                "  plot_every: 0",
+                "  num_workers: 0",
+                "  pin_memory: false",
+                "masking:",
+                "  token_mask_prob: 0.5",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    model_cfg = config_dir / "model.yaml"
+    model_cfg.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  d_model: 32",
+                "  n_heads: 4",
+                "  n_layers: 1",
+                "  d_ffn: 64",
+                "  dropout: 0.0",
+                "  max_profile_tokens: 4",
+                "  max_event_tokens: 4",
+                "  max_events: 3",
+                "  profile_layers: 1",
+                "  event_layers: 1",
+                "  history_layers: 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pretrain_mlm",
+            "--config",
+            str(train_cfg),
+            "--model_config",
+            str(model_cfg),
+            "--data_dir",
+            str(tokenized_dir),
+            "--split_dir",
+            str(split_dir),
+            "--output_dir",
+            str(output_dir),
+            "--tokenizer_dir",
+            str(tokenizer_dir),
+            "--device",
+            "cpu",
+        ],
+    )
+
+    pretrain_mlm.main()
+
+    entries = load_metrics(output_dir / "metrics.jsonl")
+    valid_entries = [entry for entry in entries if entry.get("kind") == "valid"]
+    assert len(valid_entries) == 1
+    valid_entry = valid_entries[0]
+    assert valid_entry["eval_mode"] == "quick"
+    assert "valid_acc_categorical" in valid_entry
+    assert "valid_acc_numerical" in valid_entry
+    assert "valid_acc_text" in valid_entry
+    assert "valid_top5_acc" in valid_entry

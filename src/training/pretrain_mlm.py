@@ -782,6 +782,32 @@ def _evaluate(
             "valid_batches": float(total_batches),
         }
     )
+    default_metric_values: dict[str, float] = {
+        "valid_top5_acc": 0.0,
+        "valid_acc_categorical": 0.0,
+        "valid_acc_numerical": 0.0,
+        "valid_acc_text": 0.0,
+        "valid_acc_special": 0.0,
+        "valid_loss_categorical": 0.0,
+        "valid_loss_numerical": 0.0,
+        "valid_loss_text": 0.0,
+        "valid_loss_special": 0.0,
+        "valid_acc_token_mask": 0.0,
+        "valid_acc_key_mask": 0.0,
+        "valid_acc_event_mask": 0.0,
+        "valid_loss_token_mask": 0.0,
+        "valid_loss_key_mask": 0.0,
+        "valid_loss_event_mask": 0.0,
+        "valid_num_bucket_mae": 0.0,
+        "valid_num_within_1_acc": 0.0,
+        "valid_num_within_2_acc": 0.0,
+    }
+    for metric_name, default_value in default_metric_values.items():
+        reduced_metrics.setdefault(metric_name, default_value)
+    if key_id_to_metric_name:
+        for metric_name in key_id_to_metric_name.values():
+            reduced_metrics.setdefault(f"valid_acc_by_key_{metric_name}", 0.0)
+            reduced_metrics.setdefault(f"valid_loss_by_key_{metric_name}", 0.0)
     if "valid_acc_text" in reduced_metrics:
         reduced_metrics.setdefault("valid_acc_text_bpe", float(reduced_metrics["valid_acc_text"]))
     if "valid_loss_text" in reduced_metrics:

@@ -1,34 +1,41 @@
 # PRAGMA Lite
 
-PRAGMA Lite is a lightweight PRAGMA-inspired transformer for transactional event sequences. It supports structured tokenization, masked pretraining, checkpoint-based inference, and frozen-probe evaluation on public AML-style datasets such as TransXion and IBM AML.
+PRAGMA Lite is a lightweight PRAGMA-inspired transformer for transactional event sequences. It currently supports structured tokenization, masked pretraining, checkpoint-based inference, reusable embedding extraction, and frozen/downstream benchmarking on public AML-style datasets such as TransXion and IBM AML.
 
-## PRAGMA vs PRA-lite Implementation Status
+## Original Vs Realized
 
-This table compares the original [PRAGMA paper (arXiv:2604.08649)](https://arxiv.org/abs/2604.08649) features with the current PRA-lite implementation.
+This table compares the original [PRAGMA paper (arXiv:2604.08649)](https://arxiv.org/abs/2604.08649) design intent with what is realized in the current PRA-lite codebase.
 
-| Category | Feature | PRAGMA | PRA-lite |
-| :--- | :--- | :---: | :---: |
-| **Architecture** | Profile Encoder (Bidirectional Transformer) | ☑️ | ☑️ |
-| | Event Encoder (Bidirectional Transformer) | ☑️ | ☑️ |
-| | History Encoder (Bidirectional Transformer) | ☑️ | ☑️ |
-| | Event-local attention kernel that prevents cross-event token attention | ☑️ | ✖️ |
-| | RoPE time/position encoding in profile and history encoders | ☑️ | ☑️ |
-| | Key-value-time representation with fused history context | ☑️ | ☑️ |
-| | Shared key/value embedding table | ☑️ | ☑️ |
-| | Learnable `[USR]` / `[EVT]` sequence prefix tokens | ☑️ | ☑️ |
-| | `[USR]` / `[EVT]` taken directly from shared token table | ☑️ | ☑️ |
-| | MLM logits matched against shared embedding table | ☑️ | ☑️ |
-| **Data Processing** | Key-Value-Time Tokenisation | ☑️ | ☑️ |
-| | Numeric Percentile Bucketing | ☑️ | ☑️ |
-| | Log-seconds Relative Time Feature | ☑️ | ☑️ |
-| | Calendar Time Features | ☑️ | ☑️ |
-| | Two-layer calendar feature MLP | ☑️ | ☑️ |
-| | Multi-value field key replication | ☑️ | ☑️ |
-| | Within-field value positions (`0,1,2,...`) | ☑️ | ☑️ |
-| | Static sine/cosine within-field positional encoding | ☑️ | ✖️ |
-| | Textual field sub-token expansion | ☑️ | ☑️ |
-| | LMDB-backed storage / shard-based streaming pipeline | ☑️ | ☑️ |
-| | Low-frequency Vocab Pruning | ✖️ | ☑️ |
+| Category | Feature | Original PRAGMA | Realized In PRA-lite | Notes |
+| :--- | :--- | :---: | :---: | :--- |
+| **Architecture** | Profile encoder | ☑️ | ☑️ | Bidirectional transformer over profile key/value tokens |
+| | Event encoder | ☑️ | ☑️ | Bidirectional transformer over event-local key/value tokens |
+| | History encoder | ☑️ | ☑️ | Bidirectional transformer over `[USR]` plus ordered `[EVT]` states |
+| | Shared key/value embedding table | ☑️ | ☑️ | `key_ids` and `value_ids` share the same token embedding table |
+| | `[USR]` / `[EVT]` taken from shared token table | ☑️ | ☑️ | No separate learned CLS parameters in the current path |
+| | MLM logits matched against shared embedding table | ☑️ | ☑️ | Current default is tied MLM output projection |
+| | Event-local attention kernel / varlen event packing | ☑️ | Partial | PRA-lite still uses rectangular padded tensors, not the paper's custom varlen packing kernel |
+| | Additive time projection + history order embedding ablations | ☑️ | ☑️ | Controlled by `use_additive_time_proj` and `use_history_order_emb` |
+| **Tokenizer / Data** | Key-value-time tokenization | ☑️ | ☑️ | Profile/event fields become key/value/time structured inputs |
+| | Numeric bucket tokenizer | ☑️ | ☑️ | Numeric fields use bucket tokens and optional `#ZERO` handling |
+| | Categorical tokenizer with field-aware unknowns | ☑️ | ☑️ | Field-specific `[UNK]` path is supported in tokenizer v2 |
+| | Text/BPE-style tokenizer | ☑️ | ☑️ | Textual fields can expand to shared `T:*` tokens via tokenizer v2 |
+| | Multi-value field expansion | ☑️ | ☑️ | Field keys are replicated and `value_pos` increments `0,1,2,...` |
+| | Within-field positional embedding path | ☑️ | ☑️ | Implemented through `value_pos_emb` once tokenizer emits `value_pos > 0` |
+| | Static sine/cosine within-field position encoding | ☑️ | ✖️ | PRA-lite uses learned `value_pos_emb`, not fixed sinusoidal within-field encoding |
+| | Calendar features + 2-layer MLP | ☑️ | ☑️ | Event calendar features are projected with a 2-layer MLP |
+| | Time-to-last-event anchoring | ☑️ | Partial | Configurable; current preprocessing path defaults to `last_event` |
+| | Tokenizer v2 metadata | N/A | ☑️ | Stores `field_value_types`, `categorical_values`, text tokenizer metadata, and limits |
+| | LMDB-backed tokenized shards | ☑️ | ☑️ | Used for static LMDB and manifest-driven streaming training |
+| **Training / Evaluation** | Masked token / key / event objectives | ☑️ | ☑️ | Current collator supports token-, key-, and event-level masking |
+| | Dynamic packing / token-budget batching | ☑️ | Partial | Event-count bucketed token-budget batching is implemented without custom varlen kernels |
+| | Batch-local trimming | N/A | ☑️ | Collation trims to batch-local active profile/event lengths |
+| | Full validation + quick validation | ☑️ | ☑️ | Same metric schema, different batch coverage |
+| | Stratified validation metrics | N/A | ☑️ | Categorical / numerical / text / key / mask-source / top-k metrics are logged |
+| | `metrics.jsonl` structured logging | N/A | ☑️ | Train and valid metrics are appended as JSONL records |
+| **Inference / Downstream** | Embedding extractor | ☑️ | ☑️ | Exports `zh_usr`, `last_evt`, `concat`, or `record` embeddings |
+| | Frozen linear probe | ☑️ | ☑️ | Logistic-regression probe on extracted representations |
+| | Downstream benchmark against tree baselines | ☑️ | ☑️ | TransXion downstream benchmark supports PRAGMA-lite vs XGBoost / CatBoost |
 
 ## Main Entry Points
 
@@ -37,6 +44,7 @@ This table compares the original [PRAGMA paper (arXiv:2604.08649)](https://arxiv
 - `src/inference/extract_embeddings.py`: embedding export
 - `src/training/linear_probe.py`: frozen linear probe
 - `scripts/benchmarks/run_lite_benchmark.py`: reproducible evaluation benchmark
+- `scripts/benchmarks/run_transxion_downstream_benchmark.py`: PRAGMA-lite vs XGBoost/CatBoost downstream benchmark
 - `scripts/benchmarks/run_transxion_benchmark.sh`: public TransXion prepare/train entry point
 - `scripts/train/run_ibm_aml_medium_streaming.sh`: IBM AML medium streaming prepare + train entry point
 
@@ -47,6 +55,10 @@ conda create -n pragma-lite python=3.10 -y
 conda activate pragma-lite
 pip install -r requirements.txt
 ```
+
+## License
+
+This repository is currently distributed under a non-commercial license. See `LICENSE` for the exact terms before using the code, weights, or derived artifacts.
 
 ## Inference
 
@@ -71,12 +83,89 @@ python -m src.inference.extract_embeddings \
   --data_dir data/processed/transxion/tokenized \
   --split test \
   --split_dir data/splits/transxion \
+  --repr_type concat \
   --batch_size 256 \
   --output_file outputs/test_embeddings.parquet \
   --device cpu
 ```
 
-If you need the representation directly in Python, use `zh_usr`, `zh_evt`, or `record_embedding` from the model output.
+Supported `--repr_type` values are:
+
+- `zh_usr`: user/history representation
+- `last_evt`: last valid event representation
+- `concat`: concatenation of `zh_usr` and `last_evt`
+- `record`: fused record embedding
+
+The exported parquet contains:
+
+```text
+entity_id
+label            # if the tokenized dataset has labels
+embedding_0
+embedding_1
+...
+embedding_d
+```
+
+If you need the representation directly in Python, use `zh_usr`, `zh_evt`, or `record_embedding` from the model output, or call the reusable extraction helpers in `src/inference/extract_embeddings.py`.
+
+## Downstream Embeddings
+
+For frozen-probe style evaluation, you can either:
+
+1. Export embeddings first and train your own downstream model.
+2. Use the existing linear probe.
+3. Run the TransXion downstream benchmark script that compares PRAGMA-lite features against raw-feature tree baselines.
+
+Export embeddings for a downstream split:
+
+```bash
+python -m src.inference.extract_embeddings \
+  --checkpoint runs/pretrain_ddp_4gpu_full/best.ckpt \
+  --data_dir data/processed/transxion_full/tokenized \
+  --split test \
+  --split_dir data/splits/transxion_full \
+  --repr_type concat \
+  --batch_size 256 \
+  --output_file outputs/transxion_full_test_concat.parquet \
+  --device cpu
+```
+
+Run the frozen linear probe:
+
+```bash
+python -m src.training.linear_probe \
+  --checkpoint runs/pretrain_ddp_4gpu_full/best.ckpt \
+  --data_dir data/processed/transxion_full/tokenized \
+  --split_dir data/splits/transxion_full \
+  --output_dir outputs/transxion_probe \
+  --repr_type concat \
+  --batch_size 256 \
+  --device cpu
+```
+
+Run the downstream benchmark against raw-feature baselines:
+
+```bash
+python scripts/benchmarks/run_transxion_downstream_benchmark.py \
+  --checkpoint runs/pretrain_ddp_4gpu_full/best.ckpt \
+  --tokenized_dir data/processed/transxion_full/tokenized \
+  --processed_dir data/processed/transxion_full \
+  --split_dir data/splits/transxion_full \
+  --output_dir outputs/transxion_downstream_benchmark \
+  --sample_size 50000 \
+  --repr_type concat \
+  --batch_size 256 \
+  --device cpu
+```
+
+This downstream benchmark:
+
+- samples roughly `5w` examples from the split files
+- extracts PRAGMA-lite embeddings for `train/valid/test`
+- trains a logistic-regression downstream head on the PRAGMA-lite embeddings
+- trains `XGBoost` and `CatBoost` on raw tabular features aggregated from `profiles.parquet` and `events.parquet`
+- reports `PR-AUC`, `ROC-AUC`, `F1`, and `F0.5`
 
 ## Lite Benchmark
 
@@ -95,6 +184,23 @@ python -m scripts.run_lite_benchmark \
 ```
 
 This benchmark evaluates `zh_usr`, `last_evt`, `concat`, and `record`, then writes predictions and `benchmark_report.json`.
+
+## Validation Metrics
+
+Pretraining validation now uses one shared metric function for both quick validation and full validation.
+
+- `quick` validation runs every `valid_every` and uses `max_valid_batches`
+- `full` validation runs every `full_valid_every` and evaluates the whole validation loader
+- both modes write the same `valid_*` keys into `metrics.jsonl`
+- the difference is coverage, not metric schema
+
+Current validation metrics include:
+
+- `valid_loss`, `valid_perplexity`, `valid_masked_accuracy`, `valid_top1_acc`, `valid_top5_acc`
+- `valid_acc_categorical`, `valid_acc_numerical`, `valid_acc_text`, plus matching `valid_loss_*`
+- `valid_acc_token_mask`, `valid_acc_key_mask`, `valid_acc_event_mask`, plus matching `valid_loss_*`
+- key-level metrics such as `valid_acc_by_key_*` and `valid_loss_by_key_*`
+- numeric reconstruction metrics such as `valid_num_bucket_mae`, `valid_num_within_1_acc`, and `valid_num_within_2_acc`
 
 ## TransXion
 
