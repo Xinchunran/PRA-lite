@@ -91,38 +91,87 @@ def _setup_plotting() -> None:
     )
 
 
-def _stratified_sample_eval_points(eval_points: pd.DataFrame, sample_size: int, seed: int) -> pd.DataFrame:
+def _balanced_sample_eval_points(
+    eval_points: pd.DataFrame,
+    sample_size: int,
+    seed: int,
+    positive_fraction: float,
+) -> pd.DataFrame:
     eligible = eval_points[eval_points["split"].isin(["train", "valid", "calibration", "test"])].copy()
     if sample_size >= len(eligible):
         return eligible.reset_index(drop=True)
-    sampled_parts: list[pd.DataFrame] = []
+    split_counts = eligible["split"].value_counts()
+    split_order = ["train", "valid", "calibration", "test"]
+    split_budgets: dict[str, int] = {}
     remaining = sample_size
-    total = len(eligible)
-    grouped = list(eligible.groupby(["split", "label"], sort=True))
-    for keys, group in grouped[:-1]:
-        del keys
-        target = int(round(sample_size * len(group) / total))
-        target = min(len(group), max(1, target))
-        sampled_parts.append(group.sample(n=target, random_state=seed, replace=False))
-        remaining -= target
-    last_group = grouped[-1][1]
-    last_target = min(len(last_group), max(1, remaining))
-    sampled_parts.append(last_group.sample(n=last_target, random_state=seed, replace=False))
+    total = int(len(eligible))
+    for split_name in split_order[:-1]:
+        count = int(split_counts.get(split_name, 0))
+        budget = min(count, max(1, int(round(sample_size * count / max(total, 1)))))
+        split_budgets[split_name] = budget
+        remaining -= budget
+    split_budgets[split_order[-1]] = min(int(split_counts.get(split_order[-1], 0)), max(1, remaining))
+
+    sampled_parts: list[pd.DataFrame] = []
+    for offset, split_name in enumerate(split_order):
+        split_frame = eligible[eligible["split"] == split_name]
+        if split_frame.empty:
+            continue
+        budget = min(len(split_frame), split_budgets.get(split_name, 0))
+        pos_frame = split_frame[split_frame["label"] == 1]
+        neg_frame = split_frame[split_frame["label"] == 0]
+        target_pos = min(len(pos_frame), int(round(budget * positive_fraction)))
+        if len(pos_frame) > 0 and target_pos == 0:
+            target_pos = 1
+        target_neg = budget - target_pos
+        if target_neg > len(neg_frame):
+            target_neg = len(neg_frame)
+            target_pos = min(len(pos_frame), budget - target_neg)
+        sampled_split = []
+        if target_pos > 0:
+            sampled_split.append(pos_frame.sample(n=target_pos, random_state=seed + offset, replace=False))
+        if target_neg > 0:
+            sampled_split.append(neg_frame.sample(n=target_neg, random_state=seed + 101 + offset, replace=False))
+        if sampled_split:
+            sampled_parts.append(pd.concat(sampled_split, ignore_index=False))
     sampled = pd.concat(sampled_parts, ignore_index=False)
-    if len(sampled) > sample_size:
-        sampled = sampled.sample(n=sample_size, random_state=seed, replace=False)
     if len(sampled) < sample_size:
         extra = eligible.loc[~eligible.index.isin(sampled.index)]
         take = min(len(extra), sample_size - len(sampled))
         if take > 0:
-            sampled = pd.concat([sampled, extra.sample(n=take, random_state=seed, replace=False)], ignore_index=False)
+            pos_extra = extra[extra["label"] == 1]
+            neg_extra = extra[extra["label"] == 0]
+            want_pos = min(len(pos_extra), int(round(take * positive_fraction)))
+            want_neg = min(len(neg_extra), take - want_pos)
+            fill_parts = []
+            if want_pos > 0:
+                fill_parts.append(pos_extra.sample(n=want_pos, random_state=seed + 997, replace=False))
+            if want_neg > 0:
+                fill_parts.append(neg_extra.sample(n=want_neg, random_state=seed + 1997, replace=False))
+            sampled = pd.concat([sampled, *fill_parts], ignore_index=False)
+    if len(sampled) > sample_size:
+        sampled = sampled.sample(n=sample_size, random_state=seed, replace=False)
     return sampled.sort_values(["split", "evaluation_time", "entity_id", "anchor_transaction_id"], kind="stable").reset_index(drop=True)
 
 
 def _load_eval_points(stream_root: Path) -> pd.DataFrame:
-    eval_points = pd.read_parquet(stream_root / "eval_points" / "eval_points.parquet")
+    eval_path = stream_root / "eval_points" / "eval_points.parquet"
+    eval_columns = [
+        "eval_id",
+        "entity_id",
+        "evaluation_time",
+        "anchor_transaction_id",
+        "label",
+        "split",
+        "eval_source",
+    ]
+    eval_points = (
+        ds.dataset(eval_path)
+        .to_table(columns=eval_columns, filter=ds.field("task") == "downstream")
+        .to_pandas()
+    )
     eval_points["evaluation_time"] = pd.to_datetime(eval_points["evaluation_time"], utc=True, errors="coerce")
-    return eval_points[eval_points["task"] == "downstream"].copy()
+    return eval_points
 
 
 def _load_transactions_for_entities(stream_root: Path, entity_ids: list[int]) -> pd.DataFrame:
@@ -559,13 +608,16 @@ def _plot_test_metrics(report: dict[str, Any], plots_dir: Path) -> None:
     _setup_plotting()
     metrics = ["pr_auc", "roc_auc", "f1", "f0_5"]
     model_names = list(report["results"].keys())
+    if not model_names:
+        return
     x = np.arange(len(metrics))
-    width = 0.24
+    width = min(0.24, 0.8 / max(len(model_names), 1))
     fig, ax = plt.subplots(figsize=(8.6, 4.2))
     for idx, model_name in enumerate(model_names):
         values = [float(report["results"][model_name]["test_metrics"][metric] or 0.0) for metric in metrics]
+        offset = (idx - (len(model_names) - 1) / 2.0) * width
         ax.bar(
-            x + (idx - 1) * width,
+            x + offset,
             values,
             width=width,
             label=model_name,
@@ -584,6 +636,71 @@ def _plot_test_metrics(report: dict[str, Any], plots_dir: Path) -> None:
     plt.close(fig)
 
 
+def _run_model_suite(
+    raw_df: pd.DataFrame,
+    embeddings_df: pd.DataFrame,
+    metrics_dir: Path,
+    predictions_dir: Path,
+    seed: int,
+    cv_folds: int,
+) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, dict[str, str]]]:
+    results: dict[str, Any] = {}
+    cv_rows: dict[str, list[dict[str, Any]]] = {}
+    skipped_models: dict[str, dict[str, str]] = {}
+    model_specs = (
+        (
+            "pragma_lite_logreg",
+            lambda: run_pragma_lite_cv(
+                embeddings_df=embeddings_df,
+                metrics_dir=metrics_dir,
+                predictions_dir=predictions_dir,
+                seed=seed,
+                cv_folds=cv_folds,
+            ),
+            False,
+        ),
+        (
+            "xgboost",
+            lambda: run_xgboost_cv(
+                raw_df=raw_df,
+                metrics_dir=metrics_dir,
+                predictions_dir=predictions_dir,
+                seed=seed,
+                cv_folds=cv_folds,
+            ),
+            True,
+        ),
+        (
+            "catboost",
+            lambda: run_catboost_cv(
+                raw_df=raw_df,
+                metrics_dir=metrics_dir,
+                predictions_dir=predictions_dir,
+                seed=seed,
+                cv_folds=cv_folds,
+            ),
+            True,
+        ),
+    )
+    for model_name, runner, optional in model_specs:
+        print(f"[ibm_downstream] run {model_name} cv", flush=True)
+        try:
+            result, model_cv_rows = runner()
+        except ImportError as exc:
+            if not optional:
+                raise
+            reason = str(exc)
+            skipped_models[model_name] = {
+                "status": "skipped_missing_dependency",
+                "reason": reason,
+            }
+            print(f"[ibm_downstream] skip {model_name}: {reason}", flush=True)
+            continue
+        results[model_name] = result
+        cv_rows[model_name] = model_cv_rows
+    return results, cv_rows, skipped_models
+
+
 def run_ibm_aml_downstream_benchmark(
     checkpoint: Path,
     stream_root: Path,
@@ -595,6 +712,7 @@ def run_ibm_aml_downstream_benchmark(
     repr_type: str,
     cv_folds: int,
     max_history_events: int,
+    positive_fraction: float,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir = output_dir / "metrics"
@@ -607,7 +725,12 @@ def run_ibm_aml_downstream_benchmark(
     print(f"[ibm_downstream] load_eval_points stream_root={stream_root}", flush=True)
     eval_points = _load_eval_points(stream_root)
     print(f"[ibm_downstream] total_downstream_eval_points={len(eval_points)}", flush=True)
-    sampled_eval = _stratified_sample_eval_points(eval_points, sample_size=sample_size, seed=seed)
+    sampled_eval = _balanced_sample_eval_points(
+        eval_points,
+        sample_size=sample_size,
+        seed=seed,
+        positive_fraction=positive_fraction,
+    )
     print(
         f"[ibm_downstream] sampled_eval_points={len(sampled_eval)} split_counts={sampled_eval['split'].value_counts().to_dict()}",
         flush=True,
@@ -635,25 +758,9 @@ def run_ibm_aml_downstream_benchmark(
     embeddings_df = embeddings_df.merge(metadata, on=["entity_id", "label"], how="left")
     embeddings_df.to_parquet(output_dir / "benchmark_data" / f"pragma_lite_{repr_type}_embeddings.parquet", index=False)
 
-    print("[ibm_downstream] run pragma_lite_logreg cv", flush=True)
-    pragma_result, pragma_cv = run_pragma_lite_cv(
+    results, cv_rows, skipped_models = _run_model_suite(
+        raw_df=raw_df,
         embeddings_df=embeddings_df,
-        metrics_dir=metrics_dir,
-        predictions_dir=predictions_dir,
-        seed=seed,
-        cv_folds=cv_folds,
-    )
-    print("[ibm_downstream] run xgboost cv", flush=True)
-    xgb_result, xgb_cv = run_xgboost_cv(
-        raw_df=raw_df,
-        metrics_dir=metrics_dir,
-        predictions_dir=predictions_dir,
-        seed=seed,
-        cv_folds=cv_folds,
-    )
-    print("[ibm_downstream] run catboost cv", flush=True)
-    cat_result, cat_cv = run_catboost_cv(
-        raw_df=raw_df,
         metrics_dir=metrics_dir,
         predictions_dir=predictions_dir,
         seed=seed,
@@ -667,19 +774,13 @@ def run_ibm_aml_downstream_benchmark(
         "output_dir": str(output_dir),
         "sample_size": int(len(sampled_eval)),
         "requested_sample_size": int(sample_size),
+        "positive_fraction": float(positive_fraction),
         "repr_type": repr_type,
         "seed": seed,
         "cv_folds": cv_folds,
-        "results": {
-            "pragma_lite_logreg": pragma_result,
-            "xgboost": xgb_result,
-            "catboost": cat_result,
-        },
-        "cv_rows": {
-            "pragma_lite_logreg": pragma_cv,
-            "xgboost": xgb_cv,
-            "catboost": cat_cv,
-        },
+        "results": results,
+        "cv_rows": cv_rows,
+        "skipped_models": skipped_models,
         "split_counts": sampled_eval["split"].value_counts().sort_index().to_dict(),
         "label_counts": sampled_eval["label"].value_counts().sort_index().to_dict(),
     }
@@ -701,6 +802,7 @@ def main() -> None:
     parser.add_argument("--repr_type", default="concat", choices=REPRESENTATION_TYPES)
     parser.add_argument("--cv_folds", type=int, default=3)
     parser.add_argument("--max_history_events", type=int, default=6500)
+    parser.add_argument("--positive_fraction", type=float, default=0.1)
     args = parser.parse_args()
     run_ibm_aml_downstream_benchmark(
         checkpoint=Path(args.checkpoint),
@@ -713,6 +815,7 @@ def main() -> None:
         repr_type=args.repr_type,
         cv_folds=args.cv_folds,
         max_history_events=args.max_history_events,
+        positive_fraction=args.positive_fraction,
     )
 
 

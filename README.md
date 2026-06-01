@@ -148,19 +148,20 @@ Run the downstream benchmark against raw-feature baselines:
 
 ```bash
 python scripts/benchmarks/run_ibm_aml_downstream_benchmark.py \
-  --checkpoint runs/pretrain_ibm_aml_li_medium_pragma_lite_full_20k_latest/last.ckpt \
+  --checkpoint runs/pretrain_ibm_aml_li_medium_pragma_lite_full_20k_latest/best.ckpt \
   --stream_root data/streaming/ibm_aml_li_medium_pragma_lite_full \
-  --output_dir runs/ibm_aml_downstream_from_20k_latest \
+  --output_dir runs/ibm_aml_downstream_balanced_from_best_20k \
   --sample_size 50000 \
   --repr_type concat \
   --batch_size 256 \
   --cv_folds 3 \
+  --positive_fraction 0.5 \
   --device cpu
 ```
 
 This downstream benchmark:
 
-- samples roughly `5w` IBM AML downstream evaluation points
+- samples roughly `5w` IBM AML downstream evaluation points with a target `0.5` positive fraction
 - rebuilds a benchmark-only tokenized dataset that is compatible with the selected checkpoint tokenizer
 - extracts PRAGMA-lite embeddings and trains a logistic-regression downstream head
 - builds raw baseline features from profile-state and anchor-transaction statistics
@@ -176,10 +177,10 @@ sbatch scripts/slurm/benchmarks/run_ibm_aml_downstream_cpu.slurm
 
 The submitted job writes to:
 
-- `runs/ibm_aml_downstream_from_20k_latest/benchmark_data`
-- `runs/ibm_aml_downstream_from_20k_latest/metrics`
-- `runs/ibm_aml_downstream_from_20k_latest/plots`
-- `runs/ibm_aml_downstream_from_20k_latest/predictions`
+- `runs/ibm_aml_downstream_balanced_from_best_20k/benchmark_data`
+- `runs/ibm_aml_downstream_balanced_from_best_20k/metrics`
+- `runs/ibm_aml_downstream_balanced_from_best_20k/plots`
+- `runs/ibm_aml_downstream_balanced_from_best_20k/predictions`
 
 ## IBM AML Dataset Stats
 

@@ -17,4 +17,8 @@ PROJECT_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || 
 cd "${PROJECT_ROOT}"
 mkdir -p "${PROJECT_ROOT}/logs"
 
+export OUTPUT_DIR="${OUTPUT_DIR:-runs/ibm_aml_downstream_balanced_from_best_20k}"
+export POSITIVE_FRACTION="${POSITIVE_FRACTION:-0.50}"
+export DEVICE="${DEVICE:-cpu}"
+
 bash "${PROJECT_ROOT}/scripts/benchmarks/run_ibm_aml_downstream_benchmark.sh"
