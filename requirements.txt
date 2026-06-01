@@ -9,3 +9,4 @@ torch>=2.1
 tokenizers>=0.15
 xgboost>=2.0
 catboost>=1.2
+matplotlib>=3.8

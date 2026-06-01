@@ -35,7 +35,7 @@ This table compares the original [PRAGMA paper (arXiv:2604.08649)](https://arxiv
 | | `metrics.jsonl` structured logging | N/A | ☑️ | Train and valid metrics are appended as JSONL records |
 | **Inference / Downstream** | Embedding extractor | ☑️ | ☑️ | Exports `zh_usr`, `last_evt`, `concat`, or `record` embeddings |
 | | Frozen linear probe | ☑️ | ☑️ | Logistic-regression probe on extracted representations |
-| | Downstream benchmark against tree baselines | ☑️ | ☑️ | TransXion downstream benchmark supports PRAGMA-lite vs XGBoost / CatBoost |
+| | Downstream benchmark against tree baselines | ☑️ | ☑️ | IBM AML downstream benchmark supports PRAGMA-lite vs XGBoost / CatBoost with CV model selection |
 
 ## Main Entry Points
 
@@ -44,7 +44,7 @@ This table compares the original [PRAGMA paper (arXiv:2604.08649)](https://arxiv
 - `src/inference/extract_embeddings.py`: embedding export
 - `src/training/linear_probe.py`: frozen linear probe
 - `scripts/benchmarks/run_lite_benchmark.py`: reproducible evaluation benchmark
-- `scripts/benchmarks/run_transxion_downstream_benchmark.py`: PRAGMA-lite vs XGBoost/CatBoost downstream benchmark
+- `scripts/benchmarks/run_ibm_aml_downstream_benchmark.py`: IBM AML downstream benchmark from pretrained checkpoint
 - `scripts/benchmarks/run_transxion_benchmark.sh`: public TransXion prepare/train entry point
 - `scripts/train/run_ibm_aml_medium_streaming.sh`: IBM AML medium streaming prepare + train entry point
 
@@ -115,7 +115,7 @@ For frozen-probe style evaluation, you can either:
 
 1. Export embeddings first and train your own downstream model.
 2. Use the existing linear probe.
-3. Run the TransXion downstream benchmark script that compares PRAGMA-lite features against raw-feature tree baselines.
+3. Run the IBM AML downstream benchmark script that compares PRAGMA-lite features against raw-feature tree baselines.
 
 Export embeddings for a downstream split:
 
@@ -147,25 +147,58 @@ python -m src.training.linear_probe \
 Run the downstream benchmark against raw-feature baselines:
 
 ```bash
-python scripts/benchmarks/run_transxion_downstream_benchmark.py \
-  --checkpoint runs/pretrain_ddp_4gpu_full/best.ckpt \
-  --tokenized_dir data/processed/transxion_full/tokenized \
-  --processed_dir data/processed/transxion_full \
-  --split_dir data/splits/transxion_full \
-  --output_dir outputs/transxion_downstream_benchmark \
+python scripts/benchmarks/run_ibm_aml_downstream_benchmark.py \
+  --checkpoint runs/pretrain_ibm_aml_li_medium_pragma_lite_full_20k_latest/last.ckpt \
+  --stream_root data/streaming/ibm_aml_li_medium_pragma_lite_full \
+  --output_dir runs/ibm_aml_downstream_from_20k_latest \
   --sample_size 50000 \
   --repr_type concat \
   --batch_size 256 \
+  --cv_folds 3 \
   --device cpu
 ```
 
 This downstream benchmark:
 
-- samples roughly `5w` examples from the split files
-- extracts PRAGMA-lite embeddings for `train/valid/test`
-- trains a logistic-regression downstream head on the PRAGMA-lite embeddings
-- trains `XGBoost` and `CatBoost` on raw tabular features aggregated from `profiles.parquet` and `events.parquet`
-- reports `PR-AUC`, `ROC-AUC`, `F1`, and `F0.5`
+- samples roughly `5w` IBM AML downstream evaluation points
+- rebuilds a benchmark-only tokenized dataset that is compatible with the selected checkpoint tokenizer
+- extracts PRAGMA-lite embeddings and trains a logistic-regression downstream head
+- builds raw baseline features from profile-state and anchor-transaction statistics
+- selects hyperparameters with cross-validation on the non-test splits
+- reports only `test` set `PR-AUC`, `ROC-AUC`, `F1`, and `F0.5`
+- writes artifacts under `runs/.../benchmark_data`, `runs/.../metrics`, `runs/.../plots`, and `runs/.../predictions`
+
+Submit the CPU Slurm job:
+
+```bash
+sbatch scripts/slurm/benchmarks/run_ibm_aml_downstream_cpu.slurm
+```
+
+The submitted job writes to:
+
+- `runs/ibm_aml_downstream_from_20k_latest/benchmark_data`
+- `runs/ibm_aml_downstream_from_20k_latest/metrics`
+- `runs/ibm_aml_downstream_from_20k_latest/plots`
+- `runs/ibm_aml_downstream_from_20k_latest/predictions`
+
+## IBM AML Dataset Stats
+
+IBM AML dataset statistics and publication-style plots are generated with:
+
+```bash
+python tools/build_ibm_aml_dataset_stats.py \
+  --processed_dir data/processed/ibm_aml_li_medium \
+  --stream_root data/streaming/ibm_aml_li_medium_pragma_lite_full \
+  --output_dir data/processed/ibm_aml_li_medium/stat_plot
+```
+
+Current outputs live under `data/processed/ibm_aml_li_medium/stat_plot` and include:
+
+- overview tables for entities, events, eval points, shards, and vocab
+- field-type counts for processed features vs tokenizer fields
+- encoder-input summaries such as mean history length, token length, and empty-history rate
+- bias summaries grouped by primary bank and dominant payment format
+- Nature-style blue/teal plots in `data/processed/ibm_aml_li_medium/stat_plot/plots`
 
 ## Lite Benchmark
 

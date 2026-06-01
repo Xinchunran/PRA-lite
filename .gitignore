@@ -4,6 +4,7 @@ logs/
 .dbg/
 rescue/
 .pytest_cache/
+.matplotlib-cache/
 **/__pycache__/
 *.pyc
 *.pyo
